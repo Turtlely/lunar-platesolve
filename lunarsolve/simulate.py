@@ -74,13 +74,36 @@ def fake_detections(cat, view, rng, p_detect=0.75, pos_noise=0.08, rad_noise=0.0
     return np.column_stack([uv, r, np.full(len(r), 0.9), tid])
 
 
+_LDEM = None
+
+
+def terrain_hit(C, d, iters=3):
+    """Ray / terrain intersection: sphere hit refined with LOLA heights (fixed-point)."""
+    global _LDEM
+    from .config import LDEM_PPD
+    from .terrain import load_ldem
+    if _LDEM is None:
+        _LDEM = load_ldem()
+    Hd, Wd = _LDEM.shape
+    pts, hit = ray_sphere(C, d)
+    for _ in range(iters):
+        lat, lon = vec_to_latlon(pts)
+        r = np.clip(((90 - lat) * LDEM_PPD - 0.5).round().astype(np.int64), 0, Hd - 1)
+        c = ((lon % 360) * LDEM_PPD - 0.5).round().astype(np.int64) % Wd
+        h = _LDEM[r, c].astype(np.float64) * 0.0005
+        pts2, hit2 = ray_sphere(C, d, R + h)
+        pts = np.where(hit2[..., None], pts2, pts)
+        hit = hit & hit2
+    return pts, hit
+
+
 def render_wac(wac, view):
-    """Image (H, W) float of the WAC mosaic seen through the camera (no terrain parallax)."""
+    """Image (H, W) float of the WAC mosaic seen through the camera, on LOLA terrain."""
     C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
     cx, cy = (W - 1) / 2, (H - 1) / 2
     vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
     d = pixel_rays(uu, vv, C, Rwc, f, cx, cy)
-    pts, hit = ray_sphere(C, d)
+    pts, hit = terrain_hit(C, d)
     lat, lon = vec_to_latlon(pts)
     gsd = np.linalg.norm(C) - R
     gsd = gsd / f
@@ -102,7 +125,7 @@ def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None):
     C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
     cx, cy = (W - 1) / 2, (H - 1) / 2
     vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
-    pts, hit = ray_sphere(C, pixel_rays(uu, vv, C, Rwc, f, cx, cy))
+    pts, hit = terrain_hit(C, pixel_rays(uu, vv, C, Rwc, f, cx, cy))
     lat, lon = vec_to_latlon(pts)
     lat0, lon0 = float(lat[H // 2, W // 2]), float(lon[H // 2, W // 2])
     x, y, ok = gnomonic_fwd(lat, lon, lat0, lon0)

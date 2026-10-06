@@ -1,0 +1,21 @@
+{
+  "camera_lat": -23.474870202258415,
+  "camera_lon": 345.008035522468,
+  "altitude_km": 249.70430243351166,
+  "altitude_sigma_km": 3.6124884370686328,
+  "focal_px": 2932.676674374263,
+  "focal_estimated": true,
+  "fov_deg": 19.806293915082364,
+  "center_lat": -25.150038557704924,
+  "center_lon": 344.33378757704145,
+  "boresight_lat": -25.150038557704924,
+  "boresight_lon": 344.33378757704145,
+  "gsd_km": 0.08828243349008809,
+  "heading_deg": 29.968921799803255,
+  "off_nadir_deg": 12.054887665137358,
+  "mirrored": false,
+  "n_matches": 36,
+  "log_odds": 176.3282795512123,
+  "rms_px": 0.9288429881627734,
+  "solve_time_s": 0.7247910499572754
+}

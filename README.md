@@ -85,7 +85,51 @@ form up to 6 quads. That is 8.6 M quads in one 8-D KD-tree.
 
 ## Results
 
-RESULTS_PLACEHOLDER
+Benchmarks use random cameras: altitude 30–1500 km, field of view 5–40°, tilt 0–20°,
+any heading, latitudes within ±80°, 1024×1024 images. They come from `scripts/eval_sim.py`.
+A solve counts as correct when the image centre is within about 4% of the footprint width (+1 km). *Wrong*
+means a solution was returned but it was not correct. *Altitude error* is the median over
+correct solves.
+
+| test | focal length | solved | wrong | median solve time | median altitude error |
+|---|---|---|---|---|---|
+| simulated detections (catalog + 8% noise, 25% missed, 15% false) | given | 55 / 60 | 0 | 0.23 s | 0.02% |
+| simulated detections | **unknown** | 55 / 60 | 0 | 0.40 s | 1.1% |
+| real WAC imagery, CraterNet detections | given | 38 / 40 | 0 | 0.46 s | 0.01% |
+| real WAC imagery, CraterNet detections | **unknown** | 36 / 40 | 0 | 0.96 s | 0.39% |
+| real WAC imagery, held-out longitudes 330–360° | given | 27 / 30 | 0 | 0.43 s | 0.02% |
+| LOLA renders, random sun 3–60°, held-out longitudes | given | 20 / 30 | 0 | 0.42 s | 0.01% |
+
+Across all 260 test views, the solver returned **no wrong solution**. Most failures are
+footprints with fewer than about 10–20 catalog craters (mare, or small footprints). The
+DEM renders show that lighting is not what limits the solver: 7/11 solved at sun elevation
+below 15° and 8/10 above 35°. Geometry is: 16/17 solved below 12° tilt, against 4/13 at
+12° or more. The DEM's 473 m resolution forces those views to 800–1500 km altitude, where
+tilt plus curvature makes the surface very oblique.
+
+With an unknown focal length, the reported altitude σ is honest. In the blind real-imagery
+run, 35 of 36 altitudes lie within 2σ, and near-nadir views (where altitude and focal length
+are degenerate) report σ of tens to hundreds of percent rather than a wrong number.
+
+Detection takes 65 ms for a 1 MP image and 190 ms for 4 MP (RTX 4060 laptop GPU). The
+CraterNet validation on held-out longitudes against the catalog: precision 0.62, recall 0.59,
+radius error 7% (WAC); precision 0.58, recall 0.51 (DEM renders). Many "false positives"
+are real craters below the catalog's completeness limit.
+
+Example ([`examples/`](examples)): a held-out view rendered from 250 km with a 20° FOV and
+12° tilt, solved blind with no focal length:
+
+```
+$ python -m lunarsolve examples/wac_view.png --overlay solved.png
+985 craters detected in 872 ms        (first call, includes CUDA warm-up; 65 ms warm)
+camera        lat -23.4749  lon 345.0080  altitude 249.7 km +/- 3.6 (focal length estimated)
+image centre  lat -25.1500  lon 344.3338  GSD 88 m/px  heading 30.0 deg  off-nadir 12.1 deg
+focal 2933 px (FOV 19.81 deg)  mirrored=False
+36 crater matches, rms 0.93 px, log-odds 176, 725 ms
+```
+(truth: camera −23.5°, 345.0°, 250 km, FOV 20°, heading 30°, off-nadir 12°)
+
+![solved example](examples/wac_view_solved.jpg)
 
 ## Usage
 
@@ -140,7 +184,27 @@ python -m pytest tests
 
 ## Limitations
 
-LIMITATIONS_PLACEHOLDER
+* **Minimum footprint.** The catalog is complete only to about 1–2 km diameter. An image
+  needs roughly 10 or more catalog craters, so footprints below about 20–30 km (or smooth
+  mare at any scale) often fail. Most benchmark failures are this case.
+* **Strong obliquity.** Quad codes are similarity-invariant. The solver retries with
+  guessed de-foreshortening warps, but views where the local surface is seen more than
+  about 35° from nadir (tilt plus the Moon's curvature across a large footprint) still fail
+  more often.
+* **Altitude without a focal length.** See *About altitude* above. In about 1 of 30
+  oblique real-imagery views, the pose and the correspondences converged together to a
+  wrong but self-consistent solution: correct location, but altitude about 50% off, with too
+  small a σ.
+* **Test imagery.** The real-imagery benchmarks use the LROC WAC mosaic draped on LOLA
+  terrain and seen through simulated cameras. That is real texture and real crater
+  morphology, but the lighting is the mosaic's fixed lighting. Spacecraft frames,
+  telescope photos and Apollo photos have not been tested yet. Effects not modelled:
+  lens distortion, rolling shutter, strong compression, and the limb in view (full-disk
+  images).
+* **Speed.** Most images solve in about 0.1–0.8 s after detection (about 50–100 ms on GPU for
+  1 MP). Hard images can use the whole time budget (default 20 s). Loading the catalog and the
+  8.6 M-quad index takes about 4 s, so keep one `Solver` alive for batch work.
+* **GPU.** Detection runs on CUDA by default. It also runs on CPU (`--device cpu`), more slowly.
 
 ## Data sources
 

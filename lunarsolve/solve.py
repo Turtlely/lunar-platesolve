@@ -689,16 +689,32 @@ class Solver:
         else:
             f_list = [(W / 2) / math.tan(math.radians(fv) / 2) for fv in np.geomspace(0.5, 120, 10)]
         best = None
-        for fc in f_list:
-            cam = self._fit_camera(dets[pairs[:, 0]], cat_ids, model, p, shape, fc)
-            if cam is None:
-                continue
-            r = rematch(cam, pairs, cat_ids, llr, fc, iters=2)
-            if best is None or (r[0][6].sum(), -r[0][5]) > (best[0][6].sum(), -best[0][5]):
-                best = r
+        best_f = None
+        profile = []                                  # (inliers, rms, altitude) per focal length
+        start = (pairs, cat_ids, llr)
+
+        def run_profile(fs):
+            nonlocal best, best_f
+            for fc in fs:
+                cam = self._fit_camera(dets[start[0][:, 0]], start[1], model, p, shape, fc)
+                if cam is None:
+                    continue
+                r = rematch(cam, *start, fc, iters=2)
+                profile.append((int(r[0][6].sum()), r[0][5], float(np.linalg.norm(r[0][0]) - R)))
+                if best is None or (r[0][6].sum(), -r[0][5]) > (best[0][6].sum(), -best[0][5]):
+                    best, best_f = r, fc
+
+        run_profile(f_list)
+        if best is not None and not focal_px:   # finer profile around the coarse optimum
+            run_profile([best_f * k for k in (0.6, 0.75, 0.87, 1.15, 1.33, 1.6)])
         if best is None:
             return None
         cam, pairs, cat_ids, llr = best
+        # Altitudes of all focal lengths that fit almost as well: the altitude/focal degeneracy.
+        n_best = max(q[0] for q in profile)
+        rms_best = min(q[1] for q in profile if q[0] == n_best)
+        alts = [q[2] for q in profile if q[0] >= n_best - max(2, 0.03 * n_best) and q[1] <= 1.25 * rms_best]
+        alt_spread = (max(alts) - min(alts)) / 2 if len(alts) > 1 else 0.0
         if not focal_px:      # free the focal length, starting from the best profile point
             cam2 = self._fit_camera(dets[pairs[:, 0]], cat_ids, model, p, shape, None, init=cam[:3])
             # the free model nests the fixed one; small inlier-count differences are noise
@@ -707,6 +723,9 @@ class Solver:
         C, Rwc, f, f_est, alt_sig, rms, keep = cam
         if len(keep) != len(pairs):
             return None
+        if not focal_px:
+            f_est = True
+            alt_sig = max(alt_sig, alt_spread)
         pairs, cat_ids = pairs[keep], cat_ids[keep]
         # Acceptance.  The final log-odds is measured after fitting the pose to the matches, so
         # it is optimistic; a correct pose must also explain most of the largest craters.
