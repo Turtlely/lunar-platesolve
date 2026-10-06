@@ -85,6 +85,36 @@ form up to 6 quads. That is 8.6 M quads in one 8-D KD-tree.
 
 ## Results
 
+### Real spacecraft imagery: Apollo Metric Camera
+
+The Apollo 15/16/17 Metric (mapping) Camera is a true frame camera (76.2 mm lens, 4.5 in
+frame, 73.7° FOV). ASU's Apollo Digital Image Archive publishes browse scans (1012×1012) and
+per-frame state vectors, which serve as ground truth. Run `scripts/eval_apollo.py`. On 40
+random frames, solved **blind** (no focal length, no position hint):
+
+| frames | solved | wrong | nadir position error | altitude error | FOV estimate | median time |
+|---|---|---|---|---|---|---|
+| all 40 | 28 | 0 | median 1.4 km, p90 2.3 km | median abs 2.6 km (~2%), bias +0.2 km | median 73.7° | 0.7 s |
+| 34 vertical | 28 | 0 | | | | |
+| 6 oblique (40° forward pitch, limb in view) | 0 | 0 | | | | |
+
+The Apollo ephemeris itself is good to roughly 1 km, so the nadir errors are near the
+limit of the ground truth. The failures:
+
+* All 6 *oblique* frames failed. The camera was pitched 40° forward, so the frame spans 3°
+  to 77° from nadir and runs to the limb. Craters there are strongly elliptical, which the
+  detector never saw in training.
+* 6 of the 34 *vertical* frames failed: 3 at very high sun (albedo-dominated, almost no
+  shadows), 1 on the night side, 1 at very low sun with the gamma-ray spectrometer boom
+  across the frame, and 1 sparse frame.
+
+![Apollo 16 frame solved blind](examples/AS16-M-1657_solved.jpg)
+
+*AS16-M-1657 (NASA/JSC/ASU), solved blind. Green: 384 craters matched to the catalog.
+Lines: latitude and longitude every 0.5°.*
+
+### Simulated cameras
+
 Benchmarks use random cameras: altitude 30–1500 km, field of view 5–40°, tilt 0–20°,
 any heading, latitudes within ±80°, 1024×1024 images. They come from `scripts/eval_sim.py`.
 A solve counts as correct when the image centre is within about 4% of the footprint width (+1 km). *Wrong*
@@ -195,12 +225,13 @@ python -m pytest tests
   oblique real-imagery views, the pose and the correspondences converged together to a
   wrong but self-consistent solution: correct location, but altitude about 50% off, with too
   small a σ.
-* **Test imagery.** The real-imagery benchmarks use the LROC WAC mosaic draped on LOLA
-  terrain and seen through simulated cameras. That is real texture and real crater
-  morphology, but the lighting is the mosaic's fixed lighting. Spacecraft frames,
-  telescope photos and Apollo photos have not been tested yet. Effects not modelled:
-  lens distortion, rolling shutter, strong compression, and the limb in view (full-disk
-  images).
+* **Oblique views with the limb in view** (for example the Apollo 40° obliques) do not solve
+  yet. A possible fix: fit the limb to get pitch, roll and altitude, resample the image to
+  a nadir view, then solve.
+* **Lighting extremes.** Very high sun (near zero phase) and night-side frames often fail.
+  The detector needs high-sun training data.
+* **Not modelled:** lens distortion, rolling shutter and strong compression. Telescope photos
+  of the whole disk have not been tested.
 * **Speed.** Most images solve in about 0.1–0.8 s after detection (about 50–100 ms on GPU for
   1 MP). Hard images can use the whole time budget (default 20 s). Loading the catalog and the
   8.6 M-quad index takes about 4 s, so keep one `Solver` alive for batch work.
