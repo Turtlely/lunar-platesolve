@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.nbi
+*.nbc
+scratch/
+*.egg-info/
+.venv/
+venv/

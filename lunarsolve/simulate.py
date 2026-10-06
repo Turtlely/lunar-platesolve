@@ -1,0 +1,88 @@
+"""Random camera views of the Moon for testing: catalog-derived fake detections and
+rendered images (WAC mosaic texture or shaded LOLA DEM) through a true pinhole camera."""
+import math
+
+import numpy as np
+
+from .config import MOON_RADIUS_KM as R
+from .geometry import latlon_to_vec, nadir_camera, pixel_rays, project, ray_sphere, vec_to_latlon, visible_from
+
+
+def random_view(rng, W=1024, H=1024, alt_range=(20, 2000), fov_range=(3, 60), tilt_max=20.0, lat_max=88.0):
+    """Random camera; altitude and FOV are drawn log-uniformly."""
+    lat = math.degrees(math.asin(rng.uniform(-math.sin(math.radians(lat_max)), math.sin(math.radians(lat_max)))))
+    lon = rng.uniform(0, 360)
+    alt = math.exp(rng.uniform(*np.log(alt_range)))
+    fov = math.exp(rng.uniform(*np.log(fov_range)))
+    f = (W / 2) / math.tan(math.radians(fov) / 2)
+    tilt = rng.uniform(0, tilt_max)
+    C, Rwc = nadir_camera(lat, lon, alt, rng.uniform(0, 360), tilt, rng.uniform(0, 360))
+    return dict(lat=lat, lon=lon, alt=alt, fov=fov, f=f, C=C, Rwc=Rwc, W=W, H=H, tilt=tilt)
+
+
+def visible_craters(cat, view, rmin_px=3.0):
+    """Catalog craters inside the image: (idx, uv, r_px)."""
+    C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
+    cx, cy = (W - 1) / 2, (H - 1) / 2
+    # footprint: rays through the corners and centre
+    us = np.array([0, W - 1, 0, W - 1, cx], float)
+    vs = np.array([0, 0, H - 1, H - 1, cy], float)
+    d = pixel_rays(us, vs, C, Rwc, f, cx, cy)
+    pts, hit = ray_sphere(C, d)
+    if not hit[4]:
+        return None
+    if hit.all():
+        cen = pts[4]
+        rad = np.max(np.linalg.norm(pts[:4] - cen, axis=1)) * 1.1
+    else:  # limb in view: whole visible hemisphere
+        cen = pts[4]
+        rad = math.pi * R / 2
+    lat0, lon0 = vec_to_latlon(cen)
+    idx = cat.query_cap(float(lat0), float(lon0), rad)
+    P = cat.points_km(idx)
+    vis = visible_from(P, C)
+    idx, P = idx[vis], P[vis]
+    uv, z = project(P, C, Rwc, f, cx, cy)
+    rng_km = np.linalg.norm(P - C, axis=1)
+    nrm = P / np.linalg.norm(P, axis=1, keepdims=True)
+    cos_e = np.abs(np.sum(nrm * (C - P), axis=1)) / rng_km
+    r_px = cat.diam[idx] / 2 * f / rng_km * np.sqrt(np.clip(cos_e, 0.05, 1))
+    ok = (z > 0) & (uv[:, 0] > -0.5) & (uv[:, 0] < W - 0.5) & (uv[:, 1] > -0.5) & (uv[:, 1] < H - 0.5) & (r_px >= rmin_px)
+    return idx[ok], uv[ok], r_px[ok]
+
+
+def fake_detections(cat, view, rng, p_detect=0.75, pos_noise=0.08, rad_noise=0.08, false_frac=0.15,
+                    rmax_frac=0.25, dmin_km=1.5):
+    res = visible_craters(cat, view)
+    if res is None:
+        return None
+    idx, uv, r = res
+    W, H = view["W"], view["H"]
+    keep = (rng.random(len(idx)) < p_detect) & (r <= rmax_frac * min(W, H)) & (cat.diam[idx] >= dmin_km)
+    uv, r, tid = uv[keep], r[keep], idx[keep]
+    uv = uv + rng.normal(0, pos_noise, (len(r), 2)) * r[:, None]
+    r = r * np.exp(rng.normal(0, rad_noise, len(r)))
+    nf = int(false_frac * len(r))
+    if nf:
+        fr = np.exp(rng.uniform(np.log(3), np.log(max(4, np.percentile(r, 90) if len(r) else 10)), nf))
+        fuv = np.column_stack([rng.uniform(0, W, nf), rng.uniform(0, H, nf)])
+        uv = np.vstack([uv, fuv])
+        r = np.concatenate([r, fr])
+        tid = np.concatenate([tid, -np.ones(nf, np.int64)])
+    # columns: x, y, r, score, true catalog index (-1 for false detections)
+    return np.column_stack([uv, r, np.full(len(r), 0.9), tid])
+
+
+def render_wac(wac, view):
+    """Image (H, W) float of the WAC mosaic seen through the camera (no terrain parallax)."""
+    C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
+    cx, cy = (W - 1) / 2, (H - 1) / 2
+    vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
+    d = pixel_rays(uu, vv, C, Rwc, f, cx, cy)
+    pts, hit = ray_sphere(C, d)
+    lat, lon = vec_to_latlon(pts)
+    gsd = np.linalg.norm(C) - R
+    gsd = gsd / f
+    img = wac.sample(lat, lon, gsd).astype(np.float32) / 255.0
+    img[~hit] = 0
+    return img

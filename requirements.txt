@@ -1,0 +1,8 @@
+# PyTorch with CUDA: install from https://pytorch.org (e.g. --index-url https://download.pytorch.org/whl/cu128)
+torch>=2.4
+numpy>=1.26
+scipy>=1.11
+numba>=0.60
+opencv-python-headless>=4.9
+pandas>=2.0
+requests
