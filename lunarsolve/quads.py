@@ -92,29 +92,34 @@ def enumerate_quads(px, py, pr, n, dmin, dmax, max_out):
 
 
 def code_variants(code, tol):
-    """Extra codes for quads near a symmetry-breaking boundary (A/B or C/D order ambiguous).
+    """Codes for every relabelling a noisy measurement could need near a symmetry boundary.
 
-    Returns a list of (code, perm) where perm reorders the canonical (A,B,C,D) indices.
+    The canonical order depends on two comparisons (xC + xD vs 1 for A/B, xC vs xD for C/D).
+    When either is within 2*tol of its boundary, noise may have flipped it relative to the
+    index, so the swapped labelling(s) are queried too.  Returns (code, perm) pairs where
+    perm maps canonical (A, B, C, D) positions of `code` to those of the variant.
     """
-    out = [(code, (0, 1, 2, 3))]
     xc, yc, xd, yd = code[:4]
     ra, rb, rc = code[4:7]
     rd = -(ra + rb + rc)
-    if abs(xc - xd) < 2 * tol:
-        c2 = code.copy()
-        c2[:4] = [xd, yd, xc, yc]
-        c2[6] = rd
-        out.append((c2, (0, 1, 3, 2)))
-    if abs(xc + xd - 1) < 2 * tol:
-        c3 = code.copy()
-        nx = [1 - xc, -yc, 1 - xd, -yd]
-        c3[4], c3[5] = rb, ra
-        if nx[0] <= nx[2]:
-            c3[:4] = nx
-            c3[6] = rc
-            out.append((c3, (1, 0, 2, 3)))
-        else:
-            c3[:4] = [nx[2], nx[3], nx[0], nx[1]]
-            c3[6] = rd
-            out.append((c3, (1, 0, 3, 2)))
+    near_ab = abs(xc + xd - 1) < 2 * tol
+    near_cd = abs(xc - xd) < 2 * tol
+    out = []
+    for ab in ((False, True) if near_ab else (False,)):
+        for cd in ((False, True) if near_cd else (False,)):
+            p = [xc, yc, xd, yd]
+            r = [ra, rb, rc, rd]
+            perm = [0, 1, 2, 3]
+            if ab:
+                p = [1 - p[0], -p[1], 1 - p[2], -p[3]]
+                r = [r[1], r[0], r[2], r[3]]
+                perm = [1, 0, 2, 3]
+            if cd:
+                p = [p[2], p[3], p[0], p[1]]
+                r = [r[0], r[1], r[3], r[2]]
+                perm = [perm[0], perm[1], perm[3], perm[2]]
+            c = code.copy()
+            c[:4] = p
+            c[4:7] = r[:3]
+            out.append((c, tuple(perm)))
     return out

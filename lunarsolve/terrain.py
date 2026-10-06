@@ -149,17 +149,22 @@ class WacMosaic:
         k = 0
         while k + 1 < len(self.levels) and self.res_km(k + 1) <= gsd_km:
             k += 1
-        img = self.levels[k]
-        ppd = self.ppd / 2 ** k
-        Hk, Wk = img.shape
         lon_c = float(np.median(lon))
         lon_u = lon_c + ((lon - lon_c + 180) % 360 - 180)
-        x = (lon_u - self.lon0) * ppd - 0.5
-        y = (self.lat0 - lat) * ppd - 0.5
-        x0 = int(np.floor(x.min())) - 1
-        x1 = int(np.ceil(x.max())) + 2
-        y0 = max(0, int(np.floor(y.min())) - 1)
-        y1 = min(Hk, int(np.ceil(y.max())) + 2)
+        while True:
+            img = self.levels[k]
+            ppd = self.ppd / 2 ** k
+            Hk, Wk = img.shape
+            x = (lon_u - self.lon0) * ppd - 0.5
+            y = (self.lat0 - lat) * ppd - 0.5
+            x0 = int(np.floor(x.min())) - 1
+            x1 = int(np.ceil(x.max())) + 2
+            y0 = max(0, int(np.floor(y.min())) - 1)
+            y1 = min(Hk, int(np.ceil(y.max())) + 2)
+            # cv2.remap needs source windows < 32767 px (wide near the poles): go coarser
+            if max(x1 - x0, y1 - y0) < 32000 or k + 1 == len(self.levels):
+                break
+            k += 1
         if y1 <= y0 or x1 - x0 > 4 * Wk:
             return np.zeros(lat.shape, np.float32)
         cols = np.arange(x0, x1) % Wk

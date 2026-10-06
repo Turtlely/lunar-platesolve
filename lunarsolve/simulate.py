@@ -8,10 +8,11 @@ from .config import MOON_RADIUS_KM as R
 from .geometry import latlon_to_vec, nadir_camera, pixel_rays, project, ray_sphere, vec_to_latlon, visible_from
 
 
-def random_view(rng, W=1024, H=1024, alt_range=(20, 2000), fov_range=(3, 60), tilt_max=20.0, lat_max=88.0):
+def random_view(rng, W=1024, H=1024, alt_range=(20, 2000), fov_range=(3, 60), tilt_max=20.0, lat_max=88.0,
+                lon_range=(0, 360)):
     """Random camera; altitude and FOV are drawn log-uniformly."""
     lat = math.degrees(math.asin(rng.uniform(-math.sin(math.radians(lat_max)), math.sin(math.radians(lat_max)))))
-    lon = rng.uniform(0, 360)
+    lon = rng.uniform(*lon_range)
     alt = math.exp(rng.uniform(*np.log(alt_range)))
     fov = math.exp(rng.uniform(*np.log(fov_range)))
     f = (W / 2) / math.tan(math.radians(fov) / 2)
@@ -86,3 +87,60 @@ def render_wac(wac, view):
     img = wac.sample(lat, lon, gsd).astype(np.float32) / 255.0
     img[~hit] = 0
     return img
+
+
+def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None):
+    """Shaded LOLA DEM seen through the camera, with cast shadows and a random sun.
+
+    Shading is computed on a sun-aligned tangent grid around the footprint (as in training),
+    then sampled along the camera rays.  Returns (image, sun elevation, sun azimuth).
+    """
+    import torch
+    import torch.nn.functional as F
+    from .geometry import enu_basis, gnomonic_fwd
+    from .synth import grid_latlon, sensor_model
+    C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
+    cx, cy = (W - 1) / 2, (H - 1) / 2
+    vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
+    pts, hit = ray_sphere(C, pixel_rays(uu, vv, C, Rwc, f, cx, cy))
+    lat, lon = vec_to_latlon(pts)
+    lat0, lon0 = float(lat[H // 2, W // 2]), float(lon[H // 2, W // 2])
+    x, y, ok = gnomonic_fwd(lat, lon, lat0, lon0)
+    ext = float(np.max(np.hypot(x[hit & ok], y[hit & ok])))
+    gsd = max(np.linalg.norm(C - pts[H // 2, W // 2]) / f, dem.res_km[0])
+    S1 = int(min(4096, 2 * ext / gsd + 64)) // 2 * 2
+    g = 2 * ext / (S1 - 64)
+    sun_el = math.radians(sun_el_deg if sun_el_deg is not None else rng.uniform(3, 60))
+    sun_az = math.radians(sun_az_deg if sun_az_deg is not None else rng.uniform(0, 360))
+    beta = sun_az + math.pi
+    ax = np.array([math.sin(beta), math.cos(beta)])
+    ay = np.array([math.cos(beta), -math.sin(beta)])
+    dev = dem.device
+    c1 = (S1 - 1) / 2
+    ii = torch.arange(S1, device=dev, dtype=torch.float64) - c1
+    gi, gj = torch.meshgrid(ii, ii, indexing="xy")
+    xk = (gi * ax[0] + gj * ay[0]) * g
+    yk = (gi * ax[1] + gj * ay[1]) * g
+    glat, glon = grid_latlon(xk, yk, lat0, lon0)
+    h = dem.sample(glat, glon, dem.level_for(g)).double()
+    z = h - (xk ** 2 + yk ** 2) / (2 * R)
+    zx = torch.zeros_like(z)
+    zy = torch.zeros_like(z)
+    zx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / (2 * g)
+    zy[1:-1, :] = (z[2:, :] - z[:-2, :]) / (2 * g)
+    nrm = torch.rsqrt(1 + zx ** 2 + zy ** 2)
+    mu0 = ((zx * math.cos(sun_el) + math.sin(sun_el)) * nrm).clamp_min(0)
+    L = rng.uniform(0.2, 0.8)
+    phot = (1 - L) * mu0 + L * 2 * mu0 / (mu0 + nrm + 1e-6)
+    Hs = z + (gi + c1) * g * math.tan(sun_el)
+    shadow = torch.cummax(Hs, dim=1).values > Hs + 1e-5
+    rad = torch.where(shadow, torch.zeros_like(phot), phot).float() + 0.01
+    # sample along camera rays: tangent km -> sun-aligned grid pixel
+    gx = (x * ax[0] + y * ax[1]) / g + c1
+    gy = (x * ay[0] + y * ay[1]) / g + c1
+    grid = torch.tensor(np.stack([(gx + 0.5) / S1 * 2 - 1, (gy + 0.5) / S1 * 2 - 1], -1)[None],
+                        dtype=torch.float32, device=dev)
+    img = F.grid_sample(rad[None, None], grid, mode="bilinear", align_corners=False)
+    img = img * torch.tensor((hit & ok).astype(np.float32), device=dev)[None, None]
+    img = sensor_model(img, rng, dev)
+    return img[0, 0].cpu().numpy(), math.degrees(sun_el), math.degrees(sun_az)

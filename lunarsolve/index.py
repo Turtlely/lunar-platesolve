@@ -22,7 +22,7 @@ from .quads import CODE_DIM, enumerate_quads
 S0 = 8.0
 N_LEVELS = 15
 M_NEAR = 9
-Q_PER_CELL = 3
+Q_PER_CELL = 6
 
 
 def level_band(l):

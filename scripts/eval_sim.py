@@ -15,7 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lunarsolve.config import MOON_RADIUS_KM  # noqa: E402
 from lunarsolve.geometry import angular_dist_deg, pixel_rays, ray_sphere, vec_to_latlon  # noqa: E402
-from lunarsolve.simulate import fake_detections, random_view, render_wac  # noqa: E402
+from lunarsolve.simulate import fake_detections, random_view, render_dem, render_wac  # noqa: E402
 from lunarsolve.solve import Solver  # noqa: E402
 
 
@@ -29,7 +29,7 @@ def truth_center(v):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["fake", "wac"], default="fake")
+    ap.add_argument("--mode", choices=["fake", "wac", "dem"], default="fake")
     ap.add_argument("--n", type=int, default=40)
     ap.add_argument("--seed", type=int, default=5)
     ap.add_argument("--size", type=int, default=1024)
@@ -38,22 +38,30 @@ def main():
     ap.add_argument("--tilt", type=float, default=20)
     ap.add_argument("--blind-focal", action="store_true")
     ap.add_argument("--max-time", type=float, default=15)
-    ap.add_argument("--min-gsd", type=float, default=0.1, help="km/px; WAC renders finer than 0.1 are upsampled")
+    ap.add_argument("--min-gsd", type=float, default=None,
+                    help="km/px; default 0.1 for wac (mosaic resolution) and 0.5 for dem")
+    ap.add_argument("--lon", type=float, nargs=2, default=(0, 360), help="longitude range (330-360 is held out)")
     ap.add_argument("--save", default=None, help="directory to save rendered test images")
     args = ap.parse_args()
 
     s = Solver()
     print(f"solver load {s.load_time:.1f}s, {len(s.index)} quads")
-    wac = None
+    wac = dem = None
     if args.mode == "wac":
         from lunarsolve.terrain import WacMosaic
         wac = WacMosaic()
+    if args.mode == "dem":
+        from lunarsolve.terrain import GpuDem
+        dem = GpuDem()
+    min_gsd = args.min_gsd if args.min_gsd is not None else {"wac": 0.1, "dem": 0.5}.get(args.mode, 0.0)
     rng = np.random.default_rng(args.seed)
     rows = []
     while len(rows) < args.n:
-        v = random_view(rng, args.size, args.size, tuple(args.alt), tuple(args.fov), args.tilt, lat_max=80)
-        if args.mode == "wac" and v["alt"] / v["f"] < args.min_gsd:
+        v = random_view(rng, args.size, args.size, tuple(args.alt), tuple(args.fov), args.tilt, lat_max=80,
+                        lon_range=tuple(args.lon))
+        if v["alt"] / v["f"] < min_gsd:
             continue
+        extra = ""
         if args.mode == "fake":
             d = fake_detections(s.cat, v, rng)
             if d is None or len(d) < 6:
@@ -63,7 +71,11 @@ def main():
                           max_time=args.max_time)
             nd = len(d)
         else:
-            img = render_wac(wac, v)
+            if args.mode == "wac":
+                img = render_wac(wac, v)
+            else:
+                img, el, az = render_dem(dem, v, rng)
+                extra = f" sun {el:4.1f}"
             if args.save:
                 import cv2
                 Path(args.save).mkdir(parents=True, exist_ok=True)
@@ -86,7 +98,7 @@ def main():
         tag = "OK  " if ok else ("BAD " if sol is not None else "FAIL")
         print(f"{tag} alt {r['alt']:6.0f} fov {r['fov']:4.1f} tilt {r['tilt']:4.1f} det {nd:5d} match {r['nm']:4d} "
               f"centre err {r['cerr']:7.2f} km  alt err {100 * r['aerr']:+6.1f}% (sigma {100 * r['asig']:5.1f}%)  "
-              f"{dt * 1000:6.0f} ms", flush=True)
+              f"{dt * 1000:6.0f} ms{extra}", flush=True)
     ok = np.array([r["ok"] for r in rows])
     solved = np.array([r["solved"] for r in rows])
     t = np.array([r["t"] for r in rows])

@@ -29,8 +29,15 @@ from .index import QuadIndex
 from .quads import code_variants, enumerate_quads
 
 LOG_R_TOL = 0.4      # radius agreement for a detection-catalog match (ln units)
-P_MATCH = 0.6        # P(detection has a catalog counterpart | correct solution)
-CAT_COMPLETE_KM = 2.0  # only detections at least this big (implied diameter) can be scored
+P_MATCH = 0.6        # P(detection has a catalog counterpart | correct solution), large craters
+CAT_MIN_KM = 1.0     # catalog floor: smaller detections carry no evidence
+WEAK_LOG_ODDS = 18.0 # accepted only if the largest craters are matched too (see _finish)
+STRONG_LOG_ODDS = 60.0  # accepted whatever fraction of the largest craters is matched
+
+
+def p_match(d_km):
+    """P(catalog counterpart) vs implied diameter: the catalog is incomplete below ~2 km."""
+    return P_MATCH * np.clip((d_km - 0.7) / 1.8, 0.15, 1.0)
 
 
 @dataclass
@@ -57,7 +64,9 @@ class Solution:
     C: np.ndarray = field(repr=False)
     Rwc: np.ndarray = field(repr=False)
     shape: tuple = field(repr=False)
-    matches: np.ndarray = field(repr=False)        # (K, 2): detection index, catalog index
+    matches: np.ndarray = field(repr=False)        # (K, 2): row of `dets`, catalog index
+    dets: np.ndarray = field(default=None, repr=False)  # detections used (x, y, r), largest first
+    top_frac: float = float("nan")    # matched fraction of the 20 largest catalog-sized detections
 
     def pixel_to_latlon(self, u, v):
         H, W = self.shape
@@ -177,6 +186,21 @@ class Homography:
         return Homography(Hm / Hm[2, 2], lat0, lon0)
 
 
+class Warped:
+    """A 2-D model applied after a fixed linear pre-warp of pixel coordinates (used to undo
+    foreshortening in oblique views): img_to_tan(uv) = model.img_to_tan(uv @ A.T)."""
+
+    def __init__(self, model, A):
+        self.m, self.A, self.Ai = model, A, np.linalg.inv(A)
+        self.lat0, self.lon0 = model.lat0, model.lon0
+
+    def img_to_tan(self, uv):
+        return self.m.img_to_tan(uv @ self.A.T)
+
+    def tan_to_img(self, xy):
+        return self.m.tan_to_img(xy) @ self.Ai.T
+
+
 def local_scale(model, uv):
     """km per pixel (area-equivalent) of a 2-D model at an image point."""
     pts = np.array([uv, uv + [1.0, 0], uv + [0, 1.0]], float)
@@ -185,8 +209,9 @@ def local_scale(model, uv):
     return math.sqrt(abs(d1[0] * d2[1] - d1[1] * d2[0]))
 
 
-def fit_model(uv, xy, p, lat0, lon0):
-    """Similarity / affine / homography depending on support, with outlier trimming."""
+def fit_model(uv, xy, p, lat0, lon0, A=None):
+    """Similarity / affine / homography depending on support, with outlier trimming.
+    A (optional 2x2 pre-warp) keeps a low-support similarity in the de-foreshortened frame."""
     keep = np.ones(len(uv), bool)
     for _ in range(3):
         n = keep.sum()
@@ -196,6 +221,8 @@ def fit_model(uv, xy, p, lat0, lon0):
             m = Homography.fit(uv[keep], xy[keep], lat0, lon0)
         elif n >= 8:
             m = Affine.fit(uv[keep], xy[keep], lat0, lon0)
+        elif A is not None:
+            m = Warped(Similarity.fit(uv[keep] @ A.T, xy[keep], p, lat0, lon0), A)
         else:
             m = Similarity.fit(uv[keep], xy[keep], p, lat0, lon0)
         res = np.linalg.norm(m.img_to_tan(uv) - xy, axis=1)
@@ -216,7 +243,7 @@ class Solver:
         self.index = index or QuadIndex()
         self._model = model
         self.device = device
-        _ = self.cat.tree, self.cat.rim_height
+        _ = self.cat.tree, self.cat.rim_height, self.bin_trees
         self.load_time = time.time() - t
         self.stats = {}
 
@@ -285,7 +312,7 @@ class Solver:
         return np.array(pairs, np.int64).reshape(-1, 2), tol
 
     @staticmethod
-    def _log_odds(dets, cat_uvr, pairs, tol, area, exclude=()):
+    def _log_odds(dets, cat_uvr, pairs, tol, area, km_per_px, exclude=()):
         """Sum over detections of log P(data | match model) / P(data | chance)."""
         lr_cat = np.sort(np.log(cat_uvr[:, 2])) if len(cat_uvr) else np.zeros(0)
         matched = np.zeros(len(dets), bool)
@@ -293,21 +320,22 @@ class Solver:
         lr = np.log(dets[:, 2])
         n_sim = np.searchsorted(lr_cat, lr + LOG_R_TOL) - np.searchsorted(lr_cat, lr - LOG_R_TOL)
         p_bg = np.clip(n_sim * math.pi * tol ** 2 / area, 1e-4, 0.9)
-        terms = np.where(matched, np.log(P_MATCH / p_bg), np.log((1 - P_MATCH) / (1 - p_bg)))
+        pm = np.maximum(p_match(2 * dets[:, 2] * km_per_px), p_bg * 1.01)
+        terms = np.where(matched, np.log(pm / p_bg), np.log((1 - pm) / (1 - p_bg)))
         if len(exclude):
             terms[list(exclude)] = 0.0
         return float(terms.sum())
 
     def _evaluate(self, model, dets, shape, km, center_px=None, radius_px=None):
         # Craters below the catalog's completeness limit carry no evidence either way.
-        valid = np.nonzero(dets[:, 2] * 2 * km >= CAT_COMPLETE_KM)[0]
+        valid = np.nonzero(dets[:, 2] * 2 * km >= CAT_MIN_KM)[0]
         if len(valid) < 3:
             return -np.inf, np.zeros((0, 2), np.int64), np.zeros(0, np.int64)
         d = dets[valid]
         idx, cat_uvr = self._view_catalog(model, shape, d[:, 2].min(), km, center_px, radius_px)
         pairs, tol = self._match(d, cat_uvr)
         area = float(shape[0] * shape[1]) if radius_px is None else math.pi * radius_px ** 2
-        llr = self._log_odds(d, cat_uvr, pairs, tol, area)
+        llr = self._log_odds(d, cat_uvr, pairs, tol, area, km)
         pairs[:, 0] = valid[pairs[:, 0]]
         return llr, pairs, idx
 
@@ -319,7 +347,7 @@ class Solver:
     # --------------------------------------------------------------------- main entry
 
     def solve(self, img=None, dets=None, shape=None, focal_px=None, fov_deg=None, parity="both",
-              max_time=20.0, code_tol=0.08, accept_log_odds=30.0, verbose=False):
+              max_time=20.0, code_tol=0.08, accept_log_odds=25.0, verbose=False):
         """Blind solve.  Give either an image, or detections (N, >=3: x, y, r[, score]) plus shape.
 
         Query quads come from two sources, interleaved cheapest-first:
@@ -336,7 +364,7 @@ class Solver:
             focal_px = (W / 2) / math.tan(math.radians(fov_deg) / 2)
         if dets.shape[1] > 3:
             dets = dets[dets[:, 3] >= 0.35]
-        dets = dets[np.argsort(-dets[:, 2])][:, :3].astype(np.float64)
+        dets = dets[np.argsort(-dets[:, 2], kind="stable")][:, :3].astype(np.float64)
         self.stats = dict(n_hyp=0, n_pre=0, n_det=len(dets), t_detect=time.time() - t0)
         self._accept = accept_log_odds
         if len(dets) < 6:
@@ -345,9 +373,24 @@ class Solver:
         tried = set()
         seen_quads = set()
 
+        def oblique(n, t):
+            """Quads of the n largest detections after undoing a guessed foreshortening
+            (tilt t degrees, toward six azimuths)."""
+            n = min(n, len(dets))
+            for a in range(0, 180, 30):
+                c, s_ = math.cos(math.radians(a)), math.sin(math.radians(a))
+                Rm = np.array([[c, -s_], [s_, c]])
+                A = Rm @ np.diag([1 / math.cos(math.radians(t)), 1.0]) @ Rm.T
+                q = dets[:n, :2] @ A.T
+                for p in parities:
+                    codes, qidx, cost = enumerate_quads(q[:, 0].copy(), -p * q[:, 1], dets[:n, 2].copy(),
+                                                        n, 6.0, 1e9, 500000)
+                    order = np.argsort(cost, kind="stable")
+                    yield f"oblique{t:.0f}/{a}", p, codes[order], qidx[order], A
+
         def batches():
             prev = 0
-            local = self._local_quads(dets, shape)
+            local = None                       # built lazily: easy images solve before it is needed
             for N in (8, 11, 14, 18, 23, 30, 40):
                 n = min(N, len(dets))
                 if n > prev:
@@ -356,23 +399,36 @@ class Solver:
                                                             dets[:n, 2].copy(), n, 6.0, 1e9, 500000)
                         sel = qidx.max(1) >= prev
                         order = np.argsort(cost[sel], kind="stable")
-                        yield f"top{n}", p, codes[sel][order], qidx[sel][order]
+                        yield f"top{n}", p, codes[sel][order], qidx[sel][order], None
                     prev = n
+                if N >= 14 and local is None:
+                    local = self._local_quads(dets, shape)
                 if N >= 14 and local:          # interleave one local-rule scale per round
                     qs = local.pop(0)
                     for p in parities:
-                        yield "local", p, *self._codes_for(dets, qs, p)
+                        yield "local", p, *self._codes_for(dets, qs, p), None
+                if N == 14:
+                    yield from oblique(14, 30.0)
+                if N == 23:
+                    yield from oblique(14, 45.0)
+                    yield from oblique(23, 30.0)
+            if local is None:
+                local = self._local_quads(dets, shape)
             while local:
                 qs = local.pop(0)
                 for p in parities:
-                    yield "local", p, *self._codes_for(dets, qs, p)
+                    yield "local", p, *self._codes_for(dets, qs, p), None
+            yield from oblique(23, 45.0)
+            yield from oblique(14, 20.0)
+            yield from oblique(14, 55.0)
 
-        for name, p, codes, qidx in batches():
+        for name, p, codes, qidx, A in batches():
             if len(codes) == 0:
                 continue
+            wid = None if A is None else name
             keep = []
             for k in range(len(qidx)):
-                key = (p, tuple(sorted(qidx[k].tolist())))
+                key = (p, wid, tuple(sorted(qidx[k].tolist())))
                 if key not in seen_quads:
                     seen_quads.add(key)
                     keep.append(k)
@@ -393,15 +449,26 @@ class Solver:
             # Verify the closest code matches first: chance matches fill the tolerance ball
             # uniformly in 8-D, so they pile up near its edge while true matches sit near 0.
             hd = np.linalg.norm(self.index.codes[hj] - qcodes[hq], axis=1)
-            for o in np.argsort(hd, kind="stable"):
-                k, perm = qperm[hq[o]]
+            order = np.argsort(hd, kind="stable")
+            hq, hj = hq[order], hj[order]
+            # drop already-tried index quads, then a vectorized pre-filter on the rest
+            fresh = np.array([(p, wid, int(j)) not in tried for j in hj], bool)
+            hq, hj = hq[fresh], hj[fresh]
+            for j in hj:
+                tried.add((p, wid, int(j)))
+            self.stats["n_hyp"] += len(hj)
+            if len(hj) == 0:
+                continue
+            di_all = np.array([qidx[qperm[q][0]][list(qperm[q][1])] for q in hq])
+            ok = np.zeros(len(hj), bool)
+            for c0 in range(0, len(hj), 4096):
+                ok[c0:c0 + 4096] = self._prefilter(dets, di_all[c0:c0 + 4096], self.index.ids[hj[c0:c0 + 4096]], p, A)
+            self.stats["n_prefilter"] = self.stats.get("n_prefilter", 0) + int(ok.sum())
+            for o in np.nonzero(ok)[0]:
                 j = int(hj[o])
-                if (p, j) in tried:
-                    continue
-                tried.add((p, j))
-                self.stats["n_hyp"] += 1
-                di = qidx[k][list(perm)]
-                res = self._try_hypothesis(dets, di, self.index.ids[j], p, shape, accept_log_odds)
+                di = di_all[o]
+                res = self._try_hypothesis(dets, di, self.index.ids[j], p, shape,
+                                           min(accept_log_odds, WEAK_LOG_ODDS), A)
                 if res is not None:
                     sol = self._finish(dets, res, shape, focal_px, t0)
                     if sol is not None:
@@ -416,6 +483,80 @@ class Solver:
         if verbose:
             print(f"no solution: {self.stats}")
         return None
+
+    # --------------------------------------------------------------------- fast pre-filter
+
+    BIN_W = 0.35      # width of log-diameter bins for the pre-filter trees
+
+    @property
+    def bin_trees(self):
+        if getattr(self, "_bin_trees", None) is None:
+            b = np.floor(np.log(self.cat.diam) / self.BIN_W).astype(np.int64)
+            self._bin_trees = {int(k): cKDTree(self.cat.xyz[b == k]) for k in np.unique(b)}
+        return self._bin_trees
+
+    def _prefilter(self, dets, di, ci, p, A, K=12, min_hits=3):
+        """Vectorized cheap test of many hypotheses at once.
+
+        For hypothesis h (image quad di[h] <-> catalog quad ci[h]) fit the similarity, map the
+        K largest detections near the quad onto the sphere and count those with a catalog
+        crater of similar size nearby (diameter-binned KD-trees).  Returns a boolean mask.
+        """
+        Hn = len(di)
+        xyz = self.cat.xyz
+        # tangent frame at the catalog quad's A-B midpoint
+        u = xyz[ci[:, 0]] + xyz[ci[:, 1]]
+        u /= np.linalg.norm(u, axis=1, keepdims=True)
+        e = np.stack([-u[:, 1], u[:, 0], np.zeros(Hn)], 1)
+        en = np.linalg.norm(e, axis=1, keepdims=True)
+        e = np.where(en > 1e-9, e / np.maximum(en, 1e-12), np.array([0.0, 1.0, 0.0]))
+        n = np.cross(u, e)
+        P = xyz[ci]                                            # (H, 4, 3)
+        dot = np.einsum("hkc,hc->hk", P, u)
+        w = R * (np.einsum("hkc,hc->hk", P, e) + 1j * np.einsum("hkc,hc->hk", P, n)) / dot
+        q = dets[:, :2] if A is None else dets[:, :2] @ A.T
+        zall = q[:, 0] - 1j * p * q[:, 1]
+        z = zall[di]                                           # (H, 4)
+        zm, wm = z.mean(1, keepdims=True), w.mean(1, keepdims=True)
+        a = np.sum((w - wm) * np.conj(z - zm), 1) / np.sum(np.abs(z - zm) ** 2, 1)
+        b = wm[:, 0] - a * zm[:, 0]
+        km = np.abs(a) * (1.0 if A is None else math.sqrt(abs(np.linalg.det(A))))
+        lr = np.log(self.cat.diam[ci] / 2 / (km[:, None] * dets[di, 2]))
+        ok = np.abs(np.median(lr, 1)) <= 0.35
+        # K largest detections within 1.5 |AB| of each quad (dets are sorted largest first)
+        top = min(len(dets), 250)
+        cen = dets[di, :2].mean(1)
+        ab = np.hypot(*(dets[di[:, 0], :2] - dets[di[:, 1], :2]).T)
+        dist = np.hypot(dets[None, :top, 0] - cen[:, None, 0], dets[None, :top, 1] - cen[:, None, 1])
+        near = dist < 1.5 * ab[:, None]
+        for c in range(4):                                     # exclude the quad's own craters
+            m = di[:, c] < top
+            near[np.nonzero(m)[0], di[m, c]] = False
+        rank = np.cumsum(near, 1)
+        near &= rank <= K
+        hh, jj = np.nonzero(near & ok[:, None])
+        if len(hh) == 0:
+            return np.zeros(Hn, bool)
+        wl = a[hh] * zall[jj] + b[hh]
+        v = u[hh] * R + e[hh] * wl.real[:, None] + n[hh] * wl.imag[:, None]
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+        rkm = dets[jj, 2] * km[hh]
+        valid = 2 * rkm >= CAT_MIN_KM
+        tol = np.maximum(0.5 * rkm, 2 * km[hh]) / R            # chord ~ angle for small tolerances
+        b0 = np.floor(np.log(2 * rkm) / self.BIN_W).astype(np.int64)
+        hit = np.zeros(len(hh), bool)
+        trees = self.bin_trees
+        for off in (-1, 0, 1):
+            bins = b0 + off
+            for bb in np.unique(bins[valid]):
+                t = trees.get(int(bb))
+                if t is None:
+                    continue
+                m = valid & (bins == bb) & ~hit
+                if m.any():
+                    hit[m] |= t.query_ball_point(v[m], tol[m], return_length=True) > 0
+        cnt = np.bincount(hh, weights=hit, minlength=Hn)
+        return ok & (cnt >= min_hits)
 
     @staticmethod
     def _codes_for(dets, quads, p):
@@ -465,15 +606,18 @@ class Solver:
             s /= math.sqrt(2)
         return out
 
-    def _try_hypothesis(self, dets, di, ci, p, shape, accept):
+    def _try_hypothesis(self, dets, di, ci, p, shape, accept, A=None):
         mid = self.cat.xyz[ci[0]] + self.cat.xyz[ci[1]]
         lat0, lon0 = vec_to_latlon(mid)
         lat0, lon0 = float(lat0), float(lon0)
         x, y, ok = gnomonic_fwd(self.cat.lat[ci], self.cat.lon[ci], lat0, lon0)
         if not ok.all():
             return None
-        model = Similarity.fit(dets[di, :2], np.stack([x, y], 1), p, lat0, lon0)
-        km = model.scale
+        if A is None:
+            model = Similarity.fit(dets[di, :2], np.stack([x, y], 1), p, lat0, lon0)
+        else:
+            model = Warped(Similarity.fit(dets[di, :2] @ A.T, np.stack([x, y], 1), p, lat0, lon0), A)
+        km = local_scale(model, dets[di, :2].mean(0))
         lr = np.log(self.cat.diam[ci] / 2 / (km * dets[di, 2]))
         if np.abs(np.median(lr)) > 0.35:
             return None
@@ -506,7 +650,7 @@ class Solver:
             llr, pairs, idx = self._evaluate(model, dets[sel], shape, km, c_, r_)
             if len(pairs) < 4:
                 return None
-            model = fit_model(dets[sel][pairs[:, 0], :2], self._pairs_xy(model, idx, pairs), p, lat0, lon0)
+            model = fit_model(dets[sel][pairs[:, 0], :2], self._pairs_xy(model, idx, pairs), p, lat0, lon0, A)
             km = local_scale(model, cen)
         llr, pairs, idx = self._evaluate(model, dets[sel], shape, km)
         if llr < accept or len(pairs) < 8:
@@ -524,7 +668,7 @@ class Solver:
                 C, Rwc, f = cam[0], cam[1], cam[2]
                 gsd = float(np.linalg.norm(C)) - R
                 gsd = max(gsd, 1e-3) / f
-                sel = np.nonzero(dets[:, 2] * 2 * gsd >= CAT_COMPLETE_KM)[0][:600]
+                sel = np.nonzero(dets[:, 2] * 2 * gsd >= CAT_MIN_KM)[0][:600]
                 if len(sel) < 8:
                     break
                 idx, cat_uvr = self._camera_view_catalog(C, Rwc, f, p, shape, dets[sel, 2].min())
@@ -536,7 +680,7 @@ class Solver:
                 if cam2 is None or cam2[6].sum() < cam[6].sum() - max(2, 0.02 * cam[6].sum()):
                     break
                 cam, pairs, cat_ids = cam2, np.column_stack([sel[pr[:, 0]], pr[:, 1]]), idx[pr[:, 1]]
-                llr = self._log_odds(dets[sel], cat_uvr, pr, tol, float(H * W))
+                llr = self._log_odds(dets[sel], cat_uvr, pr, tol, float(H * W), gsd)
             return cam, pairs, cat_ids, llr
 
         # Fixed focal length(s): the given one, or a profile over plausible fields of view.
@@ -561,9 +705,17 @@ class Solver:
             if cam2 is not None and cam2[6].sum() >= cam[6].sum() - max(2, 0.02 * cam[6].sum()):
                 cam, pairs, cat_ids, llr = rematch(cam2, pairs, cat_ids, llr, None, iters=2)
         C, Rwc, f, f_est, alt_sig, rms, keep = cam
-        if len(keep) != len(pairs) or llr < self._accept:
+        if len(keep) != len(pairs):
             return None
         pairs, cat_ids = pairs[keep], cat_ids[keep]
+        # Acceptance.  The final log-odds is measured after fitting the pose to the matches, so
+        # it is optimistic; a correct pose must also explain most of the largest craters.
+        gsd0 = (np.linalg.norm(C) - R) / f
+        big = np.nonzero(dets[:, 2] * 2 * gsd0 >= 2.0)[0][:20]
+        top_frac = float(np.isin(big, pairs[:, 0]).mean()) if len(big) else 0.0
+        if not (llr >= STRONG_LOG_ODDS or (llr >= self._accept and top_frac >= 0.45)
+                or (llr >= WEAK_LOG_ODDS and top_frac >= 0.7)):
+            return None
         mirrored = p < 0
         cx, cy = (W - 1) / 2, (H - 1) / 2
         clat, clon = vec_to_latlon(C)
@@ -588,7 +740,8 @@ class Solver:
                         boresight_lat=float(lat_c), boresight_lon=float(lon_c), gsd_km=gsd,
                         heading_deg=heading, off_nadir_deg=off, mirrored=mirrored, n_matches=len(pairs),
                         log_odds=float(llr), rms_px=float(rms), solve_time_s=time.time() - t0, C=C, Rwc=Rwc,
-                        shape=(H, W), matches=np.column_stack([pairs[:, 0], cat_ids]))
+                        shape=(H, W), matches=np.column_stack([pairs[:, 0], cat_ids]), dets=dets,
+                        top_frac=top_frac)
 
     # --------------------------------------------------------------------- camera
 
