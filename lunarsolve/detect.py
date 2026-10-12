@@ -1,4 +1,6 @@
 """Crater detection on arbitrary images with a scale pyramid."""
+import contextlib
+
 import cv2
 import numpy as np
 import torch
@@ -7,7 +9,17 @@ from .config import WEIGHTS_PATH
 from .model import CraterNet, decode, normalize
 
 
-def load_model(path=WEIGHTS_PATH, device="cuda"):
+def default_device():
+    """LUNARSOLVE_DEVICE if set, else "cuda" when a GPU is available, else "cpu"."""
+    import os
+    dev = os.environ.get("LUNARSOLVE_DEVICE")
+    if dev:
+        return dev
+    return "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
+
+
+def load_model(path=WEIGHTS_PATH, device=None):
+    device = device or default_device()
     model = CraterNet()
     ck = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict(ck["model"])
@@ -41,8 +53,10 @@ def nms_circles(d, dist_frac=0.4, rad_tol=0.35):
 
 
 @torch.no_grad()
-def detect(model, img, thresh=0.3, device="cuda", min_side=48, rmin=3.0):
+def detect(model, img, thresh=0.3, device=None, min_side=48, rmin=3.0):
     """Detect craters in a grayscale image (H, W) array. Returns (N,4): x, y, r (px), score."""
+    device = device or next(model.parameters()).device.type
+    on_gpu = str(device).startswith("cuda")
     img = to_gray_float(img)
     out = []
     level = 0
@@ -52,8 +66,10 @@ def detect(model, img, thresh=0.3, device="cuda", min_side=48, rmin=3.0):
         ph, pw = (-H) % 32, (-W) % 32
         t = torch.from_numpy(np.pad(cur, ((0, ph), (0, pw)), mode="reflect"))[None, None].to(device)
         t = normalize(t)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        # bf16 on the GPU; plain float32 on the CPU (autocast("cuda") queries CUDA even when disabled)
+        with (torch.autocast("cuda", dtype=torch.bfloat16) if on_gpu else contextlib.nullcontext()):
             o = model(t)
+        o = {k: v.float() for k, v in o.items()} if isinstance(o, dict) else o.float()
         d = decode(o, thresh)[0]
         d = d[(d[:, 0] < W) & (d[:, 1] < H)]
         last = min(cur.shape[0] // 2, cur.shape[1] // 2) < min_side

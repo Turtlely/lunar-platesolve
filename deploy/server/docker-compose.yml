@@ -1,0 +1,28 @@
+# API + Cloudflare Tunnel on any Linux server with Docker.
+#
+#   cp .env.example .env        # paste the tunnel token
+#   docker compose up -d --build
+#
+# The tunnel shares the network of the api container, so the tunnel's public hostname points to
+# http://localhost:8000 here, exactly as on a Windows PC that runs scripts/serve.ps1.  Moving the
+# server to a new machine needs no change in the Cloudflare dashboard or on the website.
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+      args:
+        DATA_REPO: ${LUNARSOLVE_DATA_REPO:-turtlely/lunarsolve-data}
+    environment:
+      OMP_NUM_THREADS: ${THREADS:-4}
+    restart: unless-stopped
+    # no published ports: only the tunnel can reach the API
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+    network_mode: "service:api"
+    depends_on: [api]
+    restart: unless-stopped

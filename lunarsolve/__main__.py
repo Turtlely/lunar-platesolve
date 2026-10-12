@@ -13,7 +13,8 @@ import cv2
 import numpy as np
 
 
-def draw_overlay(img, dets, sol, cat, path):
+def make_overlay(img, dets, sol):
+    """BGR image: detections (orange), catalog matches (green), latitude/longitude graticule."""
     out = cv2.cvtColor((np.clip(img, 0, 1) * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
     H, W = img.shape
     for x, y, r, *_ in dets:
@@ -42,7 +43,11 @@ def draw_overlay(img, dets, sol, cat, path):
         txt = f"lat {sol.center_lat:+.3f} lon {sol.center_lon:.3f}  alt {sol.altitude_km:.0f} km"
         cv2.putText(out, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
         cv2.putText(out, txt, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    cv2.imwrite(str(path), out)
+    return out
+
+
+def draw_overlay(img, dets, sol, cat, path):
+    cv2.imwrite(str(path), make_overlay(img, dets, sol))
 
 
 def main(argv=None):
@@ -55,6 +60,10 @@ def main(argv=None):
     ap.add_argument("--max-time", type=float, default=30.0)
     ap.add_argument("--overlay", help="write an annotated PNG here")
     ap.add_argument("--json", help="write the solution as JSON here")
+    ap.add_argument("--labels", action="store_true", help="draw IAU-named features in the overlay and list them")
+    ap.add_argument("--weights", default=None, help="CraterNet weights file")
+    ap.add_argument("--fine", action="store_true",
+                    help="use the fine catalog (Robbins + CraterNet craters down to about 0.6 km)")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args(argv)
 
@@ -65,25 +74,47 @@ def main(argv=None):
         sys.exit(f"cannot read {args.image}")
     img = to_gray_float(raw)
     t = time.time()
-    solver = Solver(device=args.device)
+    if args.fine:
+        from .catalog import Catalog
+        from .config import FINE_CATALOG_NPZ, FINE_INDEX_PATH
+        from .index import QuadIndex
+        solver = Solver(catalog=Catalog(FINE_CATALOG_NPZ), index=QuadIndex(FINE_INDEX_PATH), device=args.device)
+    else:
+        solver = Solver(device=args.device)
+    if args.weights:
+        from lunarsolve.detect import load_model
+        solver._model = load_model(args.weights, device=args.device)
     print(f"loaded catalog and index in {time.time() - t:.1f}s")
-    t = time.time()
-    dets = solver.detect(img)
-    t_det = time.time() - t
-    sol = solver.solve(dets=dets, shape=img.shape, focal_px=args.focal, fov_deg=args.fov, parity=args.parity,
-                       max_time=args.max_time)
-    print(f"{len(dets)} craters detected in {t_det * 1000:.0f} ms")
+    sol = solver.solve(img=img, focal_px=args.focal, fov_deg=args.fov, parity=args.parity, max_time=args.max_time)
+    st = solver.stats
+    print(f"{st.get('n_det', 0)} craters detected in {st.get('t_detect', 0) * 1000:.0f} ms")
+    if "limb_tilt" in st:
+        print(f"limb in view: tilt {st['limb_tilt']:.1f} deg, limb altitude {st['limb_altitude_km']:.1f} km, "
+              f"fit rms {st['limb_rms_px']:.2f} px -> solved on a nadir-rectified view")
     if sol is None:
         print("no solution found")
     else:
         print(sol.summary())
         if sol.focal_estimated and sol.altitude_sigma_km > 0.2 * sol.altitude_km:
             print("note: altitude is poorly constrained without the focal length; pass --fov or --focal")
+    feats = []
+    if sol is not None and args.labels:
+        from .names import Gazetteer
+        feats = Gazetteer().in_view(sol)
+        print(f"{len(feats)} named features in view: " + ", ".join(f["ascii"] for f in feats[:20])
+              + (" ..." if len(feats) > 20 else ""))
     if args.overlay:
-        draw_overlay(img, sol.dets if sol is not None else dets, sol, solver.cat, args.overlay)
+        out = make_overlay(img, sol.dets if sol is not None else solver.detect(img), sol)
+        if feats:
+            from .names import draw_labels
+            draw_labels(out, sol, feats)
+        cv2.imwrite(str(args.overlay), out)
     if args.json:
-        with open(args.json, "w") as fh:
-            json.dump(sol.to_dict() if sol else {"solved": False}, fh, indent=2)
+        d = sol.to_dict() if sol else {"solved": False}
+        if feats:
+            d["features"] = [{k: f[k] for k in ("name", "type", "lat", "lon", "diam_km", "u", "v")} for f in feats]
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, indent=2, ensure_ascii=False)
     return 0 if sol else 1
 
 

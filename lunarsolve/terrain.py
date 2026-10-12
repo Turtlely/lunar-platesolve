@@ -17,21 +17,23 @@ def load_ldem():
     return np.memmap(LDEM_IMG, dtype="<i2", mode="r", shape=(h, w))
 
 
-class GpuDem:
-    """DEM pyramid on the GPU, heights in km, padded by 2 columns for longitude wrap."""
+class GpuRaster:
+    """Global equirectangular raster on the GPU as a 2x pyramid, padded by 2 columns for
+    longitude wrap.  Pixel (l, s) centre: lat = 90 - (l+0.5)/ppd, lon = (s+0.5)/ppd."""
 
-    def __init__(self, device="cuda", levels=6):
+    def __init__(self, array, ppd, device="cuda", levels=6, dtype=None):
         import torch
         import torch.nn.functional as F
         self.device = device
-        a = torch.from_numpy(np.asarray(load_ldem()).astype(np.float32) * 0.0005)
-        a = a.to(device)[None, None]
+        a = torch.from_numpy(np.ascontiguousarray(array)).to(device)[None, None]
+        if dtype is not None:
+            a = a.to(dtype)
         self.levels = []
         self.ppd = []
         for k in range(levels):
             self.levels.append(self._pad(a))
-            self.ppd.append(LDEM_PPD / 2 ** k)
-            a = F.avg_pool2d(a, 2)
+            self.ppd.append(ppd / 2 ** k)
+            a = F.avg_pool2d(a.float(), 2).to(a.dtype)
         self.res_km = [2 * np.pi * 1737.4 / 360 / p for p in self.ppd]
 
     @staticmethod
@@ -46,7 +48,7 @@ class GpuDem:
         return k
 
     def sample(self, lat, lon, level):
-        """lat, lon: torch tensors (H, W) degrees. Returns heights (H, W) km (bilinear)."""
+        """lat, lon: torch tensors (H, W) degrees. Returns values (H, W) float32 (bilinear)."""
         import torch
         import torch.nn.functional as F
         t = self.levels[level]
@@ -56,8 +58,60 @@ class GpuDem:
         y = (90 - lat) * ppd - 0.5
         gx = (x + 0.5) / (W + 4) * 2 - 1
         gy = (y + 0.5) / H * 2 - 1
-        grid = torch.stack([gx, gy], dim=-1)[None].float()
-        return F.grid_sample(t, grid, mode="bilinear", padding_mode="border", align_corners=False)[0, 0]
+        grid = torch.stack([gx, gy], dim=-1)[None].to(t.dtype)
+        return F.grid_sample(t, grid, mode="bilinear", padding_mode="border", align_corners=False)[0, 0].float()
+
+
+class GpuDem(GpuRaster):
+    """LOLA DEM pyramid on the GPU, heights in km."""
+
+    def __init__(self, device="cuda", levels=6):
+        super().__init__(np.asarray(load_ldem()).astype(np.float32) * 0.0005, LDEM_PPD, device, levels)
+
+
+# ----------------------------------------------------------------------------- albedo
+
+ALBEDO_TIF = DATA_DIR / "clementine_750nm_118m.tif"
+ALBEDO_NPY = DATA_DIR / "albedo_clementine_64.npy"
+
+
+def build_albedo_64(src=ALBEDO_TIF, dst=ALBEDO_NPY):
+    """Block-average the Clementine UVVIS 750 nm mosaic (256 px/deg, imaged at low phase, so
+    nearly free of topographic shading) to the LOLA 64 px/deg grid, lon 0..360 from the left."""
+    tags = _read_geotiff_meta(src)
+    W, H = tags[256][0], tags[257][0]
+    assert tags[258][0] == 8 and tags[259][0] == 1, "expected uncompressed 8-bit"
+    offs = tags[273]
+    img = np.memmap(src, dtype=np.uint8, mode="r", offset=offs[0], shape=(H, W))
+    k = int(round(W / 360 / LDEM_PPD))
+    scale, tie = tags[33550], tags[33922]
+    deg_per_m = 180 / (np.pi * 1737400.0)
+    lon_left = tie[3] * deg_per_m - tie[0] * scale[0] * deg_per_m
+    out = np.zeros((H // k, W // k), np.float32)
+    for r in range(0, H // k, 512):
+        blk = np.asarray(img[r * k:(r + 512) * k]).astype(np.float32)
+        valid = blk > 0
+        n = valid.reshape(blk.shape[0] // k, k, -1, k).sum((1, 3))
+        ssum = blk.reshape(blk.shape[0] // k, k, -1, k).sum((1, 3))
+        out[r:r + n.shape[0]] = np.where(n > 0, ssum / np.maximum(n, 1), 0)
+    shift = int(round(-lon_left * LDEM_PPD)) % out.shape[1]      # put lon 0 at the left edge
+    out = np.roll(out, shift, axis=1)
+    med = float(np.median(out[out > 0]))
+    out[out == 0] = med                                          # fill gaps with a neutral value
+    np.save(dst, np.clip(out, 0, 255).astype(np.uint8))
+    return dst
+
+
+class GpuAlbedo(GpuRaster):
+    """Relative albedo (1 = global median) on the GPU, from the Clementine 750 nm mosaic."""
+
+    def __init__(self, device="cuda", levels=6):
+        import torch
+        if not ALBEDO_NPY.exists():
+            build_albedo_64()
+        a = np.load(ALBEDO_NPY).astype(np.float32)
+        a /= float(np.median(a))
+        super().__init__(a, LDEM_PPD, device, levels, dtype=torch.float16)
 
 
 # ----------------------------------------------------------------------------- WAC mosaic

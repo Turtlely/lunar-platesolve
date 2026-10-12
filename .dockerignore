@@ -1,0 +1,7 @@
+# Docker build context = repository root; send only what deploy/server/Dockerfile copies.
+*
+!deploy/server/requirements.txt
+!server/
+!lunarsolve/
+!weights/craternet.pt
+**/__pycache__

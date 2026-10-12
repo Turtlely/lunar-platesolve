@@ -1,0 +1,37 @@
+# API + Caddy (automatic HTTPS) for a Linux server with a public IP address and a domain name.
+#
+#   1. Point a DNS A record (for example lunar-api.example.org) to the server's IP address.
+#   2. Open ports 80 and 443 in the firewall.
+#   3. cp .env.example .env   and set DOMAIN
+#   4. docker compose -f docker-compose.caddy.yml up -d --build
+#
+# Caddy gets and renews a Let's Encrypt certificate for DOMAIN by itself.
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/server/Dockerfile
+      args:
+        DATA_REPO: ${LUNARSOLVE_DATA_REPO:-turtlely/lunarsolve-data}
+    environment:
+      OMP_NUM_THREADS: ${THREADS:-4}
+    restart: unless-stopped
+    # no published ports: only Caddy can reach the API
+
+  caddy:
+    image: caddy:2
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

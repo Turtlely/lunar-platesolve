@@ -1,0 +1,11 @@
+# HTTPS reverse proxy in front of the API (used by docker-compose.caddy.yml).
+{$DOMAIN} {
+	request_body {
+		max_size 32MB
+	}
+	reverse_proxy api:8000 {
+		transport http {
+			read_timeout 120s
+		}
+	}
+}

@@ -109,12 +109,28 @@ def sensor_model(img, rng, device):
     return img
 
 
+def lunar_lambert_L(phase_deg):
+    """Lunar-Lambert limb-darkening weight vs phase angle (McEwen 1991 polynomial).
+    L ~ 1 near zero phase (Lommel-Seeliger: topographic shading nearly vanishes, which is
+    why high-sun images are albedo-dominated), falling toward Lambert at large phase."""
+    g = phase_deg
+    return float(np.clip(1 - 0.019 * g + 2.42e-4 * g ** 2 - 1.46e-6 * g ** 3, 0.0, 1.0))
+
+
+def sample_sun_elevation(rng):
+    """Sun elevation (radians): low, mid, high and near-overhead regimes equally likely."""
+    return math.radians(rng.choice([rng.uniform(1.5, 20), rng.uniform(5, 45), rng.uniform(10, 75),
+                                    rng.uniform(45, 89)]))
+
+
 class DemRenderer:
-    def __init__(self, dem, catalog, size=256, device="cuda"):
+    def __init__(self, dem, catalog, size=256, device="cuda", albedo=None, p_real_albedo=0.75):
         self.dem = dem
         self.cat = catalog
         self.size = size
         self.device = device
+        self.albedo = albedo                 # GpuAlbedo (real albedo map) or None
+        self.p_real_albedo = p_real_albedo
 
     def render(self, B, rng, lon_range=(0, 360), gsd_range=(0.45, 4.0), tilt_max_deg=25.0):
         S = self.size
@@ -130,7 +146,7 @@ class DemRenderer:
                 if lon_range[0] <= lon0 < lon_range[1]:
                     break
             gsd = math.exp(rng.uniform(math.log(gsd_range[0]), math.log(gsd_range[1])))
-            sun_el = math.radians(rng.choice([rng.uniform(1.5, 20), rng.uniform(5, 45), rng.uniform(10, 75)]))
+            sun_el = sample_sun_elevation(rng)
             sun_az = rng.uniform(0, 2 * math.pi)   # azimuth of the sun, clockwise from north
             beta = sun_az + math.pi                 # grid +x points away from the sun
             ax = np.array([math.sin(beta), math.cos(beta)])      # (east, north)
@@ -152,15 +168,24 @@ class DemRenderer:
             nrm = torch.rsqrt(1 + zx ** 2 + zy ** 2)
             mu0 = (-zx * -math.cos(sun_el) + math.sin(sun_el)) * nrm   # n . s with s=(-cos e,0,sin e)
             mu = nrm                                                   # nadir viewer
-            L = rng.uniform(0.0, 1.0)
+            # nadir viewer: phase angle = 90 deg - sun elevation
+            L = float(np.clip(lunar_lambert_L(90 - math.degrees(sun_el)) + rng.normal(0, 0.08), 0, 1))
             mu0c = mu0.clamp_min(0)
             phot = (1 - L) * mu0c + L * 2 * mu0c / (mu0c + mu + 1e-6)
             # cast shadows: lit iff H(x) >= max_{x'<x} H(x'), H = z + x*gsd*tan(e)
             Hs = z + (gi + c1) * gsd * math.tan(sun_el)
             shadow = torch.cummax(Hs, dim=1).values > Hs + 1e-5
             ambient = rng.uniform(0.0, 0.04)
+            alb = albedo[b, 0]
+            # Clementine imaged near zero phase at low latitude only; above ~45 deg its map
+            # carries topographic shading, so the real albedo is used at low latitudes.
+            if self.albedo is not None and abs(lat0) < 45 and rng.random() < self.p_real_albedo:
+                # real albedo pattern (maria, rays, fresh-crater halos), contrast jittered
+                a_real = self.albedo.sample(lat, lon, self.albedo.level_for(gsd)).clamp_min(0.05)
+                a_real = a_real ** rng.uniform(0.6, 1.5)
+                alb = a_real * (1 + 0.3 * (alb - 1))       # keep a little fine-scale noise
             rad = torch.where(shadow, torch.zeros_like(phot), phot).float()
-            rad = rad * albedo[b, 0] + ambient * albedo[b, 0]
+            rad = rad * alb + ambient * alb
             # random final orientation, mild anisotropy (oblique view), crop to S
             rot = rng.uniform(0, 2 * math.pi)
             tilt = math.radians(rng.uniform(0, tilt_max_deg)) if rng.random() < 0.5 else 0.0

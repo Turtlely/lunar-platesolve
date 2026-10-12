@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How it works · Lunar Plate Solver</title>
+  <meta name="description" content="How the lunar plate solver finds the camera position from craters.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+          onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '\\(', right: '\\)', display: false}]})"></script>
+  <link rel="stylesheet" href="style.css?v=4">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="./">Lunar Plate Solver</a>
+    <nav><a href="./">Solve an image</a><a href="#api">API</a></nav>
+  </header>
+
+  <main class="doc">
+    <h1>How it works</h1>
+    <p class="lead">Star trackers find their direction from star patterns. This solver does the same with craters:
+      it finds crater patterns in the image, looks them up in a catalog of the Moon, and computes where the
+      camera must have been.</p>
+
+    <ol class="toc">
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#detect">Finding craters</a></li>
+      <li><a href="#quads">Crater patterns</a></li>
+      <li><a href="#index">The index</a></li>
+      <li><a href="#verify">Checking a match</a></li>
+      <li><a href="#camera">The camera position</a></li>
+      <li><a href="#horizon">Tilted views</a></li>
+      <li><a href="#accuracy">Accuracy</a></li>
+      <li><a href="#limits">Limits</a></li>
+      <li><a href="#api">API</a></li>
+      <li><a href="#credits">Data and credits</a></li>
+    </ol>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="overview">Overview</h2>
+    <p>The input is one image. Nothing else is necessary: no time, no approximate position, no camera data.
+      The output is the camera latitude, longitude and altitude, the direction the camera pointed, and the
+      latitude and longitude of every pixel.</p>
+    <ol class="flow">
+      <li><b>Image</b><span>any lighting</span></li>
+      <li><b>Find craters</b><span>neural network</span></li>
+      <li><b>Make patterns</b><span>4 craters each</span></li>
+      <li><b>Look up</b><span>8.6 million patterns</span></li>
+      <li><b>Check and fit</b><span>camera position</span></li>
+    </ol>
+    <p>A typical solve takes a few seconds. The search stops when a match passes the statistical check, or when
+      the time limit is reached.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="detect">1. Finding craters</h2>
+    <p>A convolutional neural network, CraterNet, finds the centre and the radius of each crater. It is a
+      U-Net with 6.2 million parameters. For each output pixel (half the input resolution) it gives three
+      things: the probability of a crater centre, the sub-pixel offset of the centre, and the logarithm of the
+      radius.</p>
+    <p>The main difficulty is the sun. The same crater looks completely different at sunrise, at noon, and from
+      the other side. So the network is trained only on images with known craters under many kinds of
+      lighting:</p>
+    <ul>
+      <li>the LOLA elevation model of the whole Moon, rendered with a random sun from 1.5° to 89° above the
+        horizon, with cast shadows and real surface brightness (Clementine 750 nm albedo);</li>
+      <li>crops of the LRO Wide Angle Camera mosaic (real images at 100 m per pixel);</li>
+      <li>random noise, blur, contrast and camera tilt.</li>
+    </ul>
+    <p>The training labels come from the crater catalog. One region of the Moon (longitude 330°–360°) is kept
+      out of training, to test the network on terrain it has never seen. Large craters are found on reduced
+      copies of the image (an image pyramid), so one network covers radii from 3 pixels to hundreds of
+      pixels.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="quads">2. Crater patterns</h2>
+    <p>One crater alone says almost nothing. Four craters together make a pattern that is rare enough to look
+      up. The solver uses the idea of <a href="https://astrometry.net/">astrometry.net</a>: describe each group
+      of four by a short code that does not change when the image is moved, turned or scaled.</p>
+    <figure>
+      <svg viewBox="0 0 400 250" role="img" aria-label="A crater quad: the two farthest craters A and B define a frame; C and D are given in that frame" style="max-width: 440px">
+        <g class="svg-line" stroke-width="1.4">
+          <circle cx="90" cy="200" r="22"/><circle cx="330" cy="50" r="30"/><circle cx="160" cy="95" r="14"/><circle cx="270" cy="170" r="18"/>
+        </g>
+        <g stroke="var(--muted)" stroke-dasharray="4 4" fill="none">
+          <line x1="90" y1="200" x2="330" y2="50"/><rect x="90" y="50" width="240" height="150"/>
+        </g>
+        <g class="svg-text"><text x="56" y="236">A (0, 0)</text><text x="300" y="16">B (1, 1)</text><text x="132" y="74">C</text><text x="292" y="196">D</text></g>
+      </svg>
+      <figcaption>A and B are the two craters farthest apart. They define a frame with A at (0, 0) and B at (1, 1).
+        The positions of C and D in that frame are 4 numbers that do not change with position, rotation or
+        scale. The crater sizes relative to the group give 4 more numbers.</figcaption>
+    </figure>
+    <p>The four position numbers are \((x_C, y_C, x_D, y_D)\). The other four numbers use the crater radii,
+      which the shape alone ignores. With \(m\) the mean of \(\ln r\) over the four craters:</p>
+    $$\mathbf{c} = \big(x_C,\; y_C,\; x_D,\; y_D,\; w_R(\ln r_A - m),\; w_R(\ln r_B - m),\; w_R(\ln r_C - m),\; w_S(m - \ln|AB|)\big)$$
+    <p>The weights \(w_R = 0.30\) and \(w_S = 0.15\) scale the radius terms to the noise of the detector, so all
+      8 numbers have about the same uncertainty. Swapping A with B, or C with D, gives the same group, so the
+      solver tries all the equivalent orders.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="index">3. The index</h2>
+    <p>The catalog is the Robbins (2019) database: 1.3 million craters of 1 km and larger, for the whole Moon.
+      From it the solver builds an index of crater patterns, once, ahead of time:</p>
+    <ul>
+      <li>15 size bands, from patterns about 8 km across to patterns of hundreds of km, each band
+        \(\sqrt{2}\) larger than the one before;</li>
+      <li>in each band, groups of four neighbouring craters of matching size, at evenly spaced points over the
+        whole sphere;</li>
+      <li>8.6 million patterns in total, stored in a k-d tree for fast nearest-neighbour search in 8
+        dimensions.</li>
+    </ul>
+    <p>To search, the solver makes patterns from the largest and clearest craters in the image, computes their
+      codes, and asks the tree for catalog patterns with a code within a small distance (0.08). Every answer is a
+      <em>hypothesis</em>: "these four image craters are those four catalog craters".</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="verify">4. Checking a match</h2>
+    <p>Most hypotheses are wrong: with millions of patterns, some codes agree by chance. A hypothesis is
+      accepted only when the rest of the image agrees with it. The four matched craters give a map from the
+      image to the Moon. That map predicts where every other catalog crater must appear in the image. Then the
+      solver counts:</p>
+    <ul>
+      <li>predicted craters that are found in the image (each one is evidence for the match), and</li>
+      <li>predicted craters that are missing (each one is evidence against it, unless it is too small to be
+        detected).</li>
+    </ul>
+    <p>The evidence is summed as log-odds, like in astrometry.net:</p>
+    $$\Lambda = \sum_{i} \ln \frac{P(\text{observation}_i \mid \text{true match})}{P(\text{observation}_i \mid \text{chance})}$$
+    <p>A match is accepted when \(\Lambda \ge 60\), which means odds of more than \(10^{26}\) to 1 against
+      chance. A weaker match (\(\Lambda \ge 18\)–\(25\)) is accepted only when at least 10 craters agree and the
+      largest craters of the image are among them. These rules came from tests on thousands of simulated views:
+      the solver gives no answer rather than a wrong one.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="camera">5. The camera position</h2>
+    <p>The matched craters are points on the Moon with known 3-D positions (latitude, longitude, and the height
+      of the crater rim from the LOLA elevation model). Their image positions fix the camera. The solver fits a
+      pinhole camera with 6 unknowns, position and pointing, by a robust least-squares fit (perspective-n-point).</p>
+    <figure>
+      <svg viewBox="0 0 480 230" role="img" aria-label="Camera above the surface; altitude from the apparent size of craters" style="max-width: 520px">
+        <path class="svg-line" stroke-width="1.4" d="M10 200 Q240 165 470 200"/>
+        <g class="svg-line" stroke-width="1.2"><ellipse cx="150" cy="184" rx="34" ry="6"/><ellipse cx="360" cy="184" rx="22" ry="4"/></g>
+        <g stroke="var(--muted)" stroke-dasharray="4 4"><line x1="250" y1="40" x2="116" y2="184"/><line x1="250" y1="40" x2="184" y2="184"/><line x1="250" y1="40" x2="250" y2="178"/></g>
+        <rect x="234" y="22" width="32" height="20" rx="3" class="svg-box" style="stroke: var(--text)"/>
+        <g class="svg-text"><text x="274" y="36">camera</text><text x="258" y="120">altitude</text><text x="104" y="218">crater, diameter D</text></g>
+      </svg>
+      <figcaption>Distance from the camera to a crater ≈ f · D / d, with f the focal length in pixels and d the
+        crater's diameter in the image.</figcaption>
+    </figure>
+    <p>Position along the ground comes from where the craters are. Altitude comes from how large they look: a
+      crater of diameter \(D\) that is \(d\) pixels wide in an image with focal length \(f\) pixels is about
+      \(f D / d\) away. If the field of view is unknown, the solver tries 10 values from 0.5° to 120°, keeps the
+      best fit and refines it. Then the altitude is less certain, because a camera far away with a narrow lens
+      gives almost the same image as a camera close by with a wide lens. Tilted views and long footprints
+      separate the two.</p>
+    <p>The result has a 1-sigma uncertainty from the fit. In simulations, the true position is inside 2 sigma in
+      about 9 of 10 cases.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="horizon">6. Tilted views and the horizon</h2>
+    <p>In a strongly tilted view, craters far away are squashed into thin ellipses, and the patterns change
+      shape. When the edge of the Moon is in the image, the solver uses it: the edge is a circle on the sky,
+      and its curvature and position give the camera tilt and altitude directly. The solver then re-projects the
+      image to a straight-down view and solves that view as usual.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="accuracy">7. Accuracy</h2>
+    <p>Tests on real spacecraft images and on simulated views (the solver had no position hint in any test):</p>
+    <table>
+      <tr><th>Test</th><th>Solved</th><th>Wrong</th><th>Typical error</th></tr>
+      <tr><td>Apollo 15–17 Metric Camera, random vertical frames</td><td class="n">34 / 40</td><td class="n">0</td><td class="n">1.6 km*</td></tr>
+      <tr><td>Apollo, oblique frames with the horizon</td><td class="n">27 / 40</td><td class="n">0</td><td class="n">—</td></tr>
+      <tr><td>Simulated views, real WAC images, field of view unknown</td><td class="n">33 / 40</td><td class="n">0</td><td class="n">—</td></tr>
+      <tr><td>Simulated views, field of view known</td><td class="n">40 / 40</td><td class="n">0</td><td class="n">~0.8 km</td></tr>
+      <tr><td>Three cameras on one spacecraft, solved together</td><td class="n">22 / 30</td><td class="n">0</td><td class="n">0.19 km</td></tr>
+    </table>
+    <p class="muted">* Compared with the Apollo spacecraft positions on record, which have their own errors of
+      about a kilometre.</p>
+    <p>Most of the remaining error is in the catalog itself: crater positions in the catalog and in the maps
+      disagree by a few hundred metres. An experimental refinement matches the image pixel by pixel to the WAC
+      map. In simulations with the same lighting as the map it reduces the error to about 10 m, but for real
+      photos the different sun angle moves the shadows and biases the match, so it is off by default.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="limits">8. Limits</h2>
+    <ul>
+      <li><b>High sun.</b> Near full Moon, craters show few shadows and the network finds fewer of them.</li>
+      <li><b>Small footprints.</b> The catalog has craters of 1 km and larger. An image needs about 15 of them,
+        so views less than about 25 km across rarely solve.</li>
+      <li><b>Compressed images.</b> Strong JPEG compression creates false crater detections in flat areas. Use PNG
+        or high-quality JPEG when you can.</li>
+      <li><b>Renders and art.</b> Many Moon images online are paintings or 3-D renders with invented craters. They
+        cannot match the real Moon.</li>
+    </ul>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="api">API</h2>
+    <p>The website uses a public HTTP API. You can call it from any program.</p>
+    <pre><code>curl -F image=@photo.png -F fov_deg=20 <span id="api-base">https://…</span>/api/solve</code></pre>
+    <table>
+      <tr><th>Endpoint</th><th>Input</th><th>Output</th></tr>
+      <tr><td><code>POST /api/solve</code></td><td><code>image</code> (file); optional <code>fov_deg</code>,
+        <code>parity</code>, <code>max_time</code>, <code>labels</code></td><td>camera latitude, longitude, altitude and
+        uncertainty; camera rotation and focal length; image footprint; detected and matched craters; named
+        features</td></tr>
+      <tr><td><code>GET /api/lookup?lat=&amp;lon=</code></td><td>a point</td><td>elevation, nearest named feature</td></tr>
+      <tr><td><code>GET /api/health</code></td><td></td><td>status</td></tr>
+    </table>
+    <p>Interactive documentation of every field: <code>/docs</code> on the API server.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="credits">Data and credits</h2>
+    <ul>
+      <li>Crater catalog: S. J. Robbins (2019), <i>A new global database of lunar impact craters &gt;1–2 km</i>,
+        JGR Planets.</li>
+      <li>Elevation: LRO Lunar Orbiter Laser Altimeter (LOLA), LDEM_64.</li>
+      <li>Images: LRO Camera Wide Angle Camera global mosaic, 100 m per pixel (NASA/GSFC/Arizona State University).</li>
+      <li>Albedo: Clementine UVVIS 750 nm mosaic (USGS).</li>
+      <li>Apollo Metric Camera frames: NASA/JSC/Arizona State University.</li>
+      <li>Feature names: IAU / USGS Gazetteer of Planetary Nomenclature.</li>
+      <li>Method: after D. Lang et al. (2010), <i>Astrometry.net: blind astrometric calibration of arbitrary
+        astronomical images</i>, AJ 139.</li>
+    </ul>
+  </main>
+
+  <footer class="foot"><a href="./">Solve an image</a></footer>
+  <script src="config.js?v=2"></script>
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search).get("api");
+      var base = (q || (window.LUNAR_CONFIG && window.LUNAR_CONFIG.api) || location.origin).replace(/\/$/, "");
+      document.getElementById("api-base").textContent = base;
+    })();
+  </script>
+</body>
+</html>

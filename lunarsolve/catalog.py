@@ -42,20 +42,42 @@ class Catalog:
         if not path.exists():
             build_npz()
         z = np.load(path)
-        order = np.argsort(-z["diam"])               # largest first
+        self.path = path
+        # Largest first.  The quad index and the rim-height cache store row numbers, so this order
+        # must be the same on every machine.  The default sort orders equal diameters differently on
+        # different CPUs (SIMD code paths), and 70% of the catalog rows have tied diameters, so the
+        # order is saved once next to the catalog and loaded from there.
+        order_path = path.with_name(path.stem + "_order.npy")
+        if order_path.exists():
+            order = np.load(order_path).astype(np.int64)
+            if len(order) != len(z["diam"]):
+                raise ValueError(f"{order_path.name} does not match {path.name}; delete it and rebuild the index")
+        else:
+            order = np.argsort(-z["diam"], kind="stable")
+            np.save(order_path, order.astype(np.int32))
         self.lat = z["lat"][order]
         self.lon = z["lon"][order]
         self.diam = z["diam"][order].astype(np.float64)
-        self.arc = z["arc"][order]
+        self.arc = z["arc"][order] if "arc" in z else np.zeros(len(order), np.float32)
+        self.source = z["source"][order] if "source" in z else np.zeros(len(order), np.int8)  # 0 Robbins, 1 CraterNet
         self.xyz = latlon_to_vec(self.lat, self.lon)
         self._tree = None
+        # Completeness model used by the solver's evidence score.
+        #   d_min_km:  smaller detections carry no evidence
+        #   d_ramp:    P(catalog counterpart) rises from d_ramp[0] to full at d_ramp[1]
+        #   top_km:    "large crater" size for the acceptance coverage test
+        if (self.source == 1).any():                    # fine catalog: complete to about 1 km
+            self.d_min_km, self.d_ramp, self.top_km = 0.6, (0.45, 1.3), 1.0
+        else:                                           # Robbins: complete to about 1-2 km
+            self.d_min_km, self.d_ramp, self.top_km = 1.0, (0.7, 2.5), 2.0
 
     @property
     def rim_height(self):
         """Mean LOLA elevation (km) on each crater's rim circle; cached on disk."""
         if getattr(self, "_rim_h", None) is None:
             from .config import DATA_DIR
-            p = DATA_DIR / "robbins_rim_height.npy"
+            name = "robbins_rim_height.npy" if self.path == CATALOG_NPZ else f"{self.path.stem}_rim_height.npy"
+            p = DATA_DIR / name
             if p.exists():
                 h = np.load(p)
             else:

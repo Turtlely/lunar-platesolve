@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "lunar-demo",
+      "runtimeExecutable": "C:/Users/cadmi/OneDrive/Documents/GitHub/lunar-platesolve/.venv/Scripts/python.exe",
+      "runtimeArgs": ["demo/app.py", "--port", "7860"],
+      "port": 7860
+    }
+  ]
+}

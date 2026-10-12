@@ -6,3 +6,5 @@ numba>=0.60
 opencv-python-headless>=4.9
 pandas>=2.0
 requests
+gradio>=5          # optional: only for the interactive demo (demo/app.py)
+plotly>=5          # optional: 3-D plots in the demo

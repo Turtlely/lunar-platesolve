@@ -112,7 +112,7 @@ def render_wac(wac, view):
     return img
 
 
-def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None):
+def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None, albedo=None):
     """Shaded LOLA DEM seen through the camera, with cast shadows and a random sun.
 
     Shading is computed on a sun-aligned tangent grid around the footprint (as in training),
@@ -121,7 +121,7 @@ def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None):
     import torch
     import torch.nn.functional as F
     from .geometry import enu_basis, gnomonic_fwd
-    from .synth import grid_latlon, sensor_model
+    from .synth import grid_latlon, lunar_lambert_L, sensor_model
     C, Rwc, f, W, H = view["C"], view["Rwc"], view["f"], view["W"], view["H"]
     cx, cy = (W - 1) / 2, (H - 1) / 2
     vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
@@ -153,11 +153,13 @@ def render_dem(dem, view, rng, sun_el_deg=None, sun_az_deg=None):
     zy[1:-1, :] = (z[2:, :] - z[:-2, :]) / (2 * g)
     nrm = torch.rsqrt(1 + zx ** 2 + zy ** 2)
     mu0 = ((zx * math.cos(sun_el) + math.sin(sun_el)) * nrm).clamp_min(0)
-    L = rng.uniform(0.2, 0.8)
+    L = lunar_lambert_L(90 - math.degrees(sun_el))      # approximate: phase for a nadir viewer
     phot = (1 - L) * mu0 + L * 2 * mu0 / (mu0 + nrm + 1e-6)
     Hs = z + (gi + c1) * g * math.tan(sun_el)
     shadow = torch.cummax(Hs, dim=1).values > Hs + 1e-5
     rad = torch.where(shadow, torch.zeros_like(phot), phot).float() + 0.01
+    if albedo is not None:
+        rad = rad * albedo.sample(glat, glon, albedo.level_for(g)).clamp_min(0.05)
     # sample along camera rays: tangent km -> sun-aligned grid pixel
     gx = (x * ax[0] + y * ax[1]) / g + c1
     gy = (x * ay[0] + y * ay[1]) / g + c1

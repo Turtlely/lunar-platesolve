@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lunar Plate Solver</title>
+  <meta name="description" content="Find where a photo of the Moon was taken, from its craters.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=4">
+  <script src="config.js?v=2"></script>
+  <script type="importmap">
+    {"imports": {"three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                 "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+  </script>
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="./" id="home-link">Lunar Plate Solver</a>
+    <nav><a href="how.html">How it works</a><a href="how.html#api">API</a></nav>
+  </header>
+
+  <main>
+    <!-- start -->
+    <section id="view-start" class="view">
+      <h1>Where was this Moon photo taken?</h1>
+      <p class="lead">Give an image of the lunar surface. The solver matches its craters to a catalog and returns the camera position.</p>
+
+      <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose an image">
+        <input type="file" id="file" accept="image/png,image/jpeg,image/tiff,image/webp" hidden>
+        <span>Drop an image here, or click to choose one</span>
+        <small>PNG, JPEG or TIFF, up to 30 MB. Paste also works.</small>
+      </div>
+      <p class="offline" id="offline" hidden>The solver server is not reachable right now.</p>
+
+      <details class="options">
+        <summary>Options</summary>
+        <div class="opt">
+          <label>Field of view
+            <span class="row"><input type="number" id="opt-fov" min="0" max="170" step="0.1" placeholder="unknown"> °</span>
+          </label>
+          <label>Orientation
+            <select id="opt-parity">
+              <option value="both">Detect</option>
+              <option value="normal">As taken</option>
+              <option value="mirrored">Mirrored</option>
+            </select>
+          </label>
+          <label>Time limit
+            <span class="row"><input type="range" id="opt-time" min="5" max="60" value="30"> <span id="opt-time-v">30 s</span></span>
+          </label>
+          <label class="check" id="refine-row"><input type="checkbox" id="opt-refine"> High precision (experimental)</label>
+        </div>
+      </details>
+
+      <h2 class="small-head">Examples</h2>
+      <div class="examples" id="examples"></div>
+    </section>
+
+    <!-- working -->
+    <section id="view-work" class="view" hidden>
+      <div class="work">
+        <img id="work-img" alt="">
+        <p>Solving… <span id="elapsed">0.0</span> s</p>
+        <button class="link" id="cancel">Cancel</button>
+      </div>
+    </section>
+
+    <!-- result -->
+    <section id="view-result" class="view" hidden>
+      <div class="bar">
+        <button class="link" id="again">← New image</button>
+        <span>
+          <button class="link" id="dl-png">Overlay PNG</button>
+          <button class="link" id="dl-json">JSON</button>
+        </span>
+      </div>
+
+      <div class="result">
+        <div>
+          <div class="viewer" id="viewer">
+            <canvas id="canvas"></canvas>
+            <div class="popup" id="popup" hidden></div>
+          </div>
+          <div class="under">
+            <span class="layers">
+              <label><input type="checkbox" data-layer="matched" checked> <i class="k k-matched"></i>matched</label>
+              <label><input type="checkbox" data-layer="dets"> <i class="k k-dets"></i>all craters</label>
+              <label><input type="checkbox" data-layer="grid" checked> <i class="k k-grid"></i>grid</label>
+              <label><input type="checkbox" data-layer="names" checked> <i class="k k-names"></i>names</label>
+            </span>
+            <span class="readout" id="readout">Scroll to zoom, drag to pan, click for details.</span>
+          </div>
+        </div>
+
+        <aside>
+          <h2>Camera</h2>
+          <table class="kv" id="summary"></table>
+          <p class="near" id="near"></p>
+          <p class="note" id="note" hidden></p>
+          <button class="link" id="copy-pos">Copy position</button>
+        </aside>
+      </div>
+
+      <div class="lower">
+        <div>
+          <div class="panel-head">
+            <h2>On the Moon</h2>
+            <span><button class="link" id="globe-zoom">Footprint</button> · <button class="link" id="globe-whole">Whole Moon</button></span>
+          </div>
+          <div class="globe" id="globe"><p class="globe-msg">Loading…</p></div>
+          <p class="caption"><i class="k k-foot"></i>image footprint <i class="k k-cam"></i>camera and its view</p>
+        </div>
+        <div>
+          <h2>Named features <span class="muted" id="names-count"></span></h2>
+          <ul class="names" id="names"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- failure -->
+    <section id="view-fail" class="view" hidden>
+      <div class="fail">
+        <div>
+          <h2 id="fail-title">No match</h2>
+          <p id="fail-msg"></p>
+          <ul id="fail-tips">
+            <li>Use a real photo, not a painting or a render.</li>
+            <li>Low sun works best. Near full Moon, craters show few shadows.</li>
+            <li>The view needs about 15 craters of 1 km or larger.</li>
+            <li>If you know the field of view, enter it under Options.</li>
+          </ul>
+          <p><button class="btn" id="fail-retry">Try again with more time</button> <button class="link" id="fail-back">Choose another image</button></p>
+        </div>
+        <figure>
+          <canvas id="fail-canvas"></canvas>
+          <figcaption id="fail-count"></figcaption>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    Craters: Robbins (2019). Maps: LRO WAC and LOLA. Names: IAU. <a href="how.html">How it works</a>
+  </footer>
+
+  <script type="module" src="app.js?v=3"></script>
+</body>
+</html>

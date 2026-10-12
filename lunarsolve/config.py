@@ -16,3 +16,6 @@ LDEM_IMG = DATA_DIR / "ldem_64.img"          # LOLA 64 px/deg int16, 0.5 m DN
 LDEM_PPD = 64
 WAC_TIF = DATA_DIR / "wac_100m.tif"          # LROC WAC global mosaic, 8-bit
 INDEX_PATH = DATA_DIR / "quad_index.npz"
+# Fine catalog: Robbins + CraterNet detections on the WAC 100 m mosaic (D >= ~0.65 km)
+FINE_CATALOG_NPZ = DATA_DIR / "fine_catalog.npz"
+FINE_INDEX_PATH = DATA_DIR / "quad_index_fine.npz"

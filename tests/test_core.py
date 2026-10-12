@@ -77,3 +77,24 @@ def test_code_variants_cover_relabelling():
     c2, i2, _ = enumerate_quads(pts2[:, 0].copy(), pts2[:, 1].copy(), r, 4, 0, 1e9, 10)
     variants = [v for v, _ in code_variants(c2[0], 0.01)]
     assert min(np.linalg.norm(v - c1[0]) for v in variants) < 1e-3
+
+
+def test_limb_cone_fit_recovers_tilt_and_altitude():
+    from lunarsolve.limb import LIMB_RADIUS_KM, fit_limb
+    W = H = 1000
+    f = 700.0
+    alt = 120.0
+    rho = math.asin(LIMB_RADIUS_KM / (1737.4 + alt))                  # limb seen from altitude alt
+    tilt = math.radians(40)
+    a = np.array([0.0, -math.sin(tilt), math.cos(tilt)])              # Moon centre, camera frame
+    e1 = np.cross(a, [1.0, 0, 0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(a, e1)
+    phi = np.linspace(-2, 2, 400)
+    d = math.cos(rho) * a + math.sin(rho) * (np.cos(phi)[:, None] * e1 + np.sin(phi)[:, None] * e2)
+    d = d[d[:, 2] > 0]
+    uv = d[:, :2] / d[:, 2:3] * f + [(W - 1) / 2, (H - 1) / 2]
+    uv = uv[(uv[:, 0] > 0) & (uv[:, 0] < W) & (uv[:, 1] > 0) & (uv[:, 1] < H)]
+    fit = fit_limb(uv, (H, W), f)
+    assert abs(fit["tilt_deg"] - 40) < 0.05
+    assert abs(fit["altitude_km"] - alt) < 0.5

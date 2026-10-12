@@ -30,14 +30,16 @@ from .quads import code_variants, enumerate_quads
 
 LOG_R_TOL = 0.4      # radius agreement for a detection-catalog match (ln units)
 P_MATCH = 0.6        # P(detection has a catalog counterpart | correct solution), large craters
-CAT_MIN_KM = 1.0     # catalog floor: smaller detections carry no evidence
 WEAK_LOG_ODDS = 18.0 # accepted only if the largest craters are matched too (see _finish)
 STRONG_LOG_ODDS = 60.0  # accepted whatever fraction of the largest craters is matched
+MIN_MATCHES_WEAK = 10   # below STRONG_LOG_ODDS, a solution needs at least this many matches
+LIMB_ALT_TOL = 0.2      # limb altitude and crater-solved altitude must agree to this fraction
 
 
-def p_match(d_km):
-    """P(catalog counterpart) vs implied diameter: the catalog is incomplete below ~2 km."""
-    return P_MATCH * np.clip((d_km - 0.7) / 1.8, 0.15, 1.0)
+def p_match(d_km, ramp=(0.7, 2.5)):
+    """P(catalog counterpart) vs implied diameter: rises from ramp[0] to full at ramp[1] km
+    (the catalog is incomplete for small craters)."""
+    return P_MATCH * np.clip((d_km - ramp[0]) / (ramp[1] - ramp[0]), 0.15, 1.0)
 
 
 @dataclass
@@ -67,13 +69,21 @@ class Solution:
     matches: np.ndarray = field(repr=False)        # (K, 2): row of `dets`, catalog index
     dets: np.ndarray = field(default=None, repr=False)  # detections used (x, y, r), largest first
     top_frac: float = float("nan")    # matched fraction of the 20 largest catalog-sized detections
+    cx: float = None                  # principal point (un-mirrored frame); None = image centre
+    cy: float = None
+    method: str = "direct"            # "direct" or "limb" (solved on a limb-rectified view)
+
+    def principal(self):
+        H, W = self.shape
+        return ((W - 1) / 2 if self.cx is None else self.cx), ((H - 1) / 2 if self.cy is None else self.cy)
 
     def pixel_to_latlon(self, u, v):
         H, W = self.shape
         u = np.asarray(u, float)
         if self.mirrored:
             u = W - 1 - u
-        d = pixel_rays(u, np.asarray(v, float), self.C, self.Rwc, self.focal_px, (W - 1) / 2, (H - 1) / 2)
+        cx, cy = self.principal()
+        d = pixel_rays(u, np.asarray(v, float), self.C, self.Rwc, self.focal_px, cx, cy)
         p, hit = ray_sphere(self.C, d)
         lat, lon = vec_to_latlon(p)
         return np.where(hit, lat, np.nan), np.where(hit, lon, np.nan)
@@ -234,11 +244,49 @@ def fit_model(uv, xy, p, lat0, lon0, A=None):
     return m
 
 
+def make_solution(C, Rwc, f, shape, pp, mirrored, f_est, alt_sig, rms, llr, pairs, cat_ids, dets, t0,
+                  ground_r, top_frac=float("nan"), method="direct"):
+    """Assemble a Solution from a fitted camera.  pp = principal point (un-mirrored frame)."""
+    H, W = shape
+    cx, cy = pp
+    clat, clon = vec_to_latlon(C)
+    alt = float(np.linalg.norm(C) - R)
+    uc = (W - 1) / 2                     # image centre is its own mirror image
+    vc = (H - 1) / 2
+    uvc = np.array([[uc, vc], [uc + 1, vc], [uc, vc - 1], [cx, cy]])
+    rays = pixel_rays(uvc[:, 0], uvc[:, 1], C, Rwc, f, cx, cy)
+    pts, okc = ray_sphere(C, rays, ground_r)
+    down = -C / np.linalg.norm(C)
+    off = math.degrees(math.acos(np.clip(rays[3] @ down, -1, 1)))
+    if okc[:3].all():
+        gsd = float(np.linalg.norm(pts[1] - pts[0]))
+        up_vec = pts[2] - pts[0]
+        lat_c, lon_c = vec_to_latlon(pts[0])
+        e, n_, _u = enu_basis(lat_c, lon_c)
+        heading = math.degrees(math.atan2(up_vec @ e, up_vec @ n_)) % 360
+    else:
+        gsd, heading, lat_c, lon_c = float("nan"), float("nan"), np.nan, np.nan
+    blat, blon = vec_to_latlon(pts[3]) if okc[3] else (np.nan, np.nan)
+    return Solution(camera_lat=float(clat), camera_lon=float(clon), altitude_km=alt,
+                    altitude_sigma_km=float(alt_sig), focal_px=float(f), focal_estimated=f_est,
+                    fov_deg=math.degrees(2 * math.atan(W / 2 / f)),
+                    center_lat=float(lat_c), center_lon=float(lon_c),
+                    boresight_lat=float(blat), boresight_lon=float(blon), gsd_km=gsd,
+                    heading_deg=heading, off_nadir_deg=off, mirrored=mirrored, n_matches=len(pairs),
+                    log_odds=float(llr), rms_px=float(rms), solve_time_s=time.time() - t0, C=C, Rwc=Rwc,
+                    shape=(H, W), matches=np.column_stack([pairs[:, 0], cat_ids]), dets=dets,
+                    top_frac=top_frac, cx=float(cx), cy=float(cy), method=method)
+
+
 # ----------------------------------------------------------------------------- solver
 
 class Solver:
-    def __init__(self, catalog=None, index=None, model=None, device="cuda"):
+    def __init__(self, catalog=None, index=None, model=None, device=None):
+        """device: "cuda", "cpu", or None (GPU when available)."""
         t = time.time()
+        if device is None:
+            from .detect import default_device
+            device = default_device()
         self.cat = catalog or Catalog()
         self.index = index or QuadIndex()
         self._model = model
@@ -311,8 +359,7 @@ class Solver:
                 pairs.append((i, best))
         return np.array(pairs, np.int64).reshape(-1, 2), tol
 
-    @staticmethod
-    def _log_odds(dets, cat_uvr, pairs, tol, area, km_per_px, exclude=()):
+    def _log_odds(self, dets, cat_uvr, pairs, tol, area, km_per_px, exclude=()):
         """Sum over detections of log P(data | match model) / P(data | chance)."""
         lr_cat = np.sort(np.log(cat_uvr[:, 2])) if len(cat_uvr) else np.zeros(0)
         matched = np.zeros(len(dets), bool)
@@ -320,7 +367,7 @@ class Solver:
         lr = np.log(dets[:, 2])
         n_sim = np.searchsorted(lr_cat, lr + LOG_R_TOL) - np.searchsorted(lr_cat, lr - LOG_R_TOL)
         p_bg = np.clip(n_sim * math.pi * tol ** 2 / area, 1e-4, 0.9)
-        pm = np.maximum(p_match(2 * dets[:, 2] * km_per_px), p_bg * 1.01)
+        pm = np.maximum(p_match(2 * dets[:, 2] * km_per_px, self.cat.d_ramp), p_bg * 1.01)
         terms = np.where(matched, np.log(pm / p_bg), np.log((1 - pm) / (1 - p_bg)))
         if len(exclude):
             terms[list(exclude)] = 0.0
@@ -328,7 +375,7 @@ class Solver:
 
     def _evaluate(self, model, dets, shape, km, center_px=None, radius_px=None):
         # Craters below the catalog's completeness limit carry no evidence either way.
-        valid = np.nonzero(dets[:, 2] * 2 * km >= CAT_MIN_KM)[0]
+        valid = np.nonzero(dets[:, 2] * 2 * km >= self.cat.d_min_km)[0]
         if len(valid) < 3:
             return -np.inf, np.zeros((0, 2), np.int64), np.zeros(0, np.int64)
         d = dets[valid]
@@ -347,7 +394,8 @@ class Solver:
     # --------------------------------------------------------------------- main entry
 
     def solve(self, img=None, dets=None, shape=None, focal_px=None, fov_deg=None, parity="both",
-              max_time=20.0, code_tol=0.08, accept_log_odds=25.0, verbose=False):
+              max_time=20.0, code_tol=0.08, accept_log_odds=25.0, verbose=False, principal=None,
+              limb="auto", scale_prior=None):
         """Blind solve.  Give either an image, or detections (N, >=3: x, y, r[, score]) plus shape.
 
         Query quads come from two sources, interleaved cheapest-first:
@@ -356,10 +404,25 @@ class Solver:
             and in each cell the few largest nearby detections of a suitable size.
         """
         t0 = time.time()
+        if img is not None and dets is None and limb:
+            img = np.asarray(img)
+            if img.ndim == 3 or img.dtype != np.float32:
+                from .detect import to_gray_float
+                img = to_gray_float(img)
+            fpx = focal_px
+            if fov_deg is not None and fpx is None:
+                fpx = (img.shape[1] / 2) / math.tan(math.radians(fov_deg) / 2)
+            sol = self._solve_limb(img, fpx, max_time, t0, verbose)
+            if sol is not None:
+                return sol
+            max_time = max(max_time - (time.time() - t0), 5.0)
+            t0 = time.time()
         if dets is None:
             dets = self.detect(img)
             shape = np.asarray(img).shape[:2]
         H, W = shape
+        self._pp = principal if principal is not None else ((W - 1) / 2, (H - 1) / 2)
+        self._scale_prior = scale_prior       # optional km/px(uv) callable, e.g. from the limb
         if fov_deg is not None and focal_px is None:
             focal_px = (W / 2) / math.tan(math.radians(fov_deg) / 2)
         if dets.shape[1] > 3:
@@ -523,6 +586,8 @@ class Solver:
         km = np.abs(a) * (1.0 if A is None else math.sqrt(abs(np.linalg.det(A))))
         lr = np.log(self.cat.diam[ci] / 2 / (km[:, None] * dets[di, 2]))
         ok = np.abs(np.median(lr, 1)) <= 0.35
+        if getattr(self, "_scale_prior", None) is not None:
+            ok &= np.abs(np.log(km / self._scale_prior(dets[di, :2].mean(1)))) <= 0.35
         # K largest detections within 1.5 |AB| of each quad (dets are sorted largest first)
         top = min(len(dets), 250)
         cen = dets[di, :2].mean(1)
@@ -541,7 +606,7 @@ class Solver:
         v = u[hh] * R + e[hh] * wl.real[:, None] + n[hh] * wl.imag[:, None]
         v /= np.linalg.norm(v, axis=1, keepdims=True)
         rkm = dets[jj, 2] * km[hh]
-        valid = 2 * rkm >= CAT_MIN_KM
+        valid = 2 * rkm >= self.cat.d_min_km
         tol = np.maximum(0.5 * rkm, 2 * km[hh]) / R            # chord ~ angle for small tolerances
         b0 = np.floor(np.log(2 * rkm) / self.BIN_W).astype(np.int64)
         hit = np.zeros(len(hh), bool)
@@ -557,6 +622,82 @@ class Solver:
                     hit[m] |= t.query_ball_point(v[m], tol[m], return_length=True) > 0
         cnt = np.bincount(hh, weights=hit, minlength=Hn)
         return ok & (cnt >= min_hits)
+
+    # --------------------------------------------------------------------- oblique views with the limb
+
+    LIMB_MIN_TILT = 15.0      # below this the direct solver copes with the foreshortening
+
+    def _solve_limb(self, img, focal_px, max_time, t0, verbose=False):
+        """If the limb is visible and the view is oblique: fit the limb cone, re-project to a
+        virtual nadir camera, solve that, and refine the real camera with all matches."""
+        from .limb import fit_limb, limb_points, map_points, nadir_scale_prior, rectify
+        pts, space = limb_points(img)
+        if pts is None:
+            return None
+        H, W = img.shape
+        fovs = (74.0, 55.0, 90.0, 40.0, 110.0, 30.0)
+        f_cands = [focal_px] if focal_px else [(W / 2) / math.tan(math.radians(v) / 2) for v in fovs]
+        for i, fc in enumerate(f_cands):
+            left = max_time - (time.time() - t0)
+            if left < 2:
+                break
+            fit = fit_limb(pts, (H, W), fc)
+            # a short or polluted limb arc cannot separate tilt from altitude
+            if (fit is None or fit["rms_px"] > 2.5 or fit["inliers"].sum() < 50 or fit["arc_deg"] < 45
+                    or fit["inliers"].mean() < 0.6):
+                continue
+            if fit["tilt_deg"] < self.LIMB_MIN_TILT or fit["altitude_km"] < 3:
+                return None
+            rect, info = rectify(img, fit, space_mask=space)
+            if rect is None:
+                continue
+            budget = max(left / (len(f_cands) - i), min(left, 6.0))
+            prior = nadir_scale_prior(fit["altitude_km"], info["f_v"], info["pp_v"])
+            sol_v = self.solve(img=rect, focal_px=info["f_v"], principal=info["pp_v"], parity="normal",
+                               max_time=budget, limb=False, scale_prior=prior)
+            self._scale_prior = None
+            if verbose:
+                print(f"limb: f {fc:.0f} tilt {fit['tilt_deg']:.1f} alt {fit['altitude_km']:.1f} -> "
+                      f"{'solved' if sol_v else 'no solution'}")
+            if sol_v is None:
+                continue
+            # back to the real camera: same centre, rotated axes
+            M = info["M"]
+            C = sol_v.C
+            Rwc = M @ sol_v.Rwc
+            dv = sol_v.dets
+            uv = map_points(info["H_vr"], dv[:, :2])
+            e1 = map_points(info["H_vr"], dv[:, :2] + [1.0, 0.0]) - uv
+            e2 = map_points(info["H_vr"], dv[:, :2] + [0.0, 1.0]) - uv
+            scale = np.sqrt(np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]))
+            dets_r = np.column_stack([uv, dv[:, 2] * scale])
+            pairs = sol_v.matches[:, :1]
+            cat_ids = sol_v.matches[:, 1]
+            self._pp = ((W - 1) / 2, (H - 1) / 2)
+            # free the focal length only when there are enough matches to pin it down
+            f_fit = focal_px or (fc if len(cat_ids) < 40 else None)
+            cam = self._fit_camera(dets_r[pairs[:, 0]], cat_ids, None, 1, (H, W), f_fit or fc, init=(C, Rwc, fc))
+            if f_fit is None:
+                cam = self._fit_camera(dets_r[pairs[:, 0]], cat_ids, None, 1, (H, W), None, init=(C, Rwc, fc))
+            if cam is not None and cam[6].sum() >= 0.8 * len(cat_ids):
+                C, Rwc, f, f_est, alt_sig, rms, keep = cam
+            else:
+                f, f_est, alt_sig, rms, keep = fc, focal_px is None, sol_v.altitude_sigma_km, sol_v.rms_px,                     np.ones(len(cat_ids), bool)
+            pairs = np.column_stack([pairs[keep, 0], np.arange(keep.sum())])
+            # The limb measures the altitude independently: a crater solution at the wrong
+            # focal-length guess is distorted and disagrees with it.
+            alt_c = float(np.linalg.norm(C) - R)
+            if abs(alt_c - fit["altitude_km"]) > LIMB_ALT_TOL * fit["altitude_km"]:
+                if verbose:
+                    print(f"limb: rejected, crater altitude {alt_c:.1f} vs limb {fit['altitude_km']:.1f} km")
+                continue
+            self.stats.update(limb_tilt=fit["tilt_deg"], limb_altitude_km=fit["altitude_km"],
+                              limb_rms_px=fit["rms_px"], limb_focal=fc)
+            return make_solution(C, Rwc, f, (H, W), self._pp, False, focal_px is None or f_est, alt_sig, rms,
+                                 sol_v.log_odds, pairs, cat_ids[keep], dets_r, t0,
+                                 R + float(np.median(self.cat.rim_height[cat_ids])), sol_v.top_frac,
+                                 method="limb")
+        return None
 
     @staticmethod
     def _codes_for(dets, quads, p):
@@ -668,7 +809,7 @@ class Solver:
                 C, Rwc, f = cam[0], cam[1], cam[2]
                 gsd = float(np.linalg.norm(C)) - R
                 gsd = max(gsd, 1e-3) / f
-                sel = np.nonzero(dets[:, 2] * 2 * gsd >= CAT_MIN_KM)[0][:600]
+                sel = np.nonzero(dets[:, 2] * 2 * gsd >= self.cat.d_min_km)[0][:600]
                 if len(sel) < 8:
                     break
                 idx, cat_uvr = self._camera_view_catalog(C, Rwc, f, p, shape, dets[sel, 2].min())
@@ -730,44 +871,26 @@ class Solver:
         # Acceptance.  The final log-odds is measured after fitting the pose to the matches, so
         # it is optimistic; a correct pose must also explain most of the largest craters.
         gsd0 = (np.linalg.norm(C) - R) / f
-        big = np.nonzero(dets[:, 2] * 2 * gsd0 >= 2.0)[0][:20]
+        big = np.nonzero(dets[:, 2] * 2 * gsd0 >= self.cat.top_km)[0][:20]
         top_frac = float(np.isin(big, pairs[:, 0]).mean()) if len(big) else 0.0
-        if not (llr >= STRONG_LOG_ODDS or (llr >= self._accept and top_frac >= 0.45)
-                or (llr >= WEAK_LOG_ODDS and top_frac >= 0.7)):
+        enough = len(pairs) >= MIN_MATCHES_WEAK
+        if not (llr >= STRONG_LOG_ODDS or (enough and llr >= self._accept and top_frac >= 0.45)
+                or (enough and llr >= WEAK_LOG_ODDS and top_frac >= 0.7)):
             return None
-        mirrored = p < 0
-        cx, cy = (W - 1) / 2, (H - 1) / 2
-        clat, clon = vec_to_latlon(C)
-        alt = float(np.linalg.norm(C) - R)
-        uvc = np.array([[cx, cy], [cx + 1, cy], [cx, cy - 1]])
-        rays = pixel_rays(uvc[:, 0], uvc[:, 1], C, Rwc, f, cx, cy)
-        pts, okc = ray_sphere(C, rays, R + float(np.median(self.cat.rim_height[cat_ids])))
-        down = -C / np.linalg.norm(C)
-        off = math.degrees(math.acos(np.clip(rays[0] @ down, -1, 1)))
-        if okc.all():
-            gsd = float(np.linalg.norm(pts[1] - pts[0]))
-            up_vec = pts[2] - pts[0]
-            lat_c, lon_c = vec_to_latlon(pts[0])
-            e, n_, _u = enu_basis(lat_c, lon_c)
-            heading = math.degrees(math.atan2(up_vec @ e, up_vec @ n_)) % 360
-        else:
-            gsd, heading, lat_c, lon_c = float("nan"), float("nan"), np.nan, np.nan
-        return Solution(camera_lat=float(clat), camera_lon=float(clon), altitude_km=alt,
-                        altitude_sigma_km=float(alt_sig), focal_px=float(f), focal_estimated=f_est,
-                        fov_deg=math.degrees(2 * math.atan(W / 2 / f)),
-                        center_lat=float(lat_c), center_lon=float(lon_c),
-                        boresight_lat=float(lat_c), boresight_lon=float(lon_c), gsd_km=gsd,
-                        heading_deg=heading, off_nadir_deg=off, mirrored=mirrored, n_matches=len(pairs),
-                        log_odds=float(llr), rms_px=float(rms), solve_time_s=time.time() - t0, C=C, Rwc=Rwc,
-                        shape=(H, W), matches=np.column_stack([pairs[:, 0], cat_ids]), dets=dets,
-                        top_frac=top_frac)
+        return make_solution(C, Rwc, f, shape, self._pp_cam(p, W), p < 0, f_est, alt_sig, rms, llr, pairs,
+                             cat_ids, dets, t0, R + float(np.median(self.cat.rim_height[cat_ids])), top_frac)
 
     # --------------------------------------------------------------------- camera
+
+    def _pp_cam(self, p, W):
+        """Principal point in the camera's (un-mirrored) frame."""
+        cx, cy = self._pp
+        return (W - 1 - cx if p < 0 else cx), cy
 
     def _camera_view_catalog(self, C, Rwc, f, p, shape, rmin_px):
         """Catalog craters seen by a camera: indices and (u, v, r) in the image's own frame."""
         H, W = shape
-        cx, cy = (W - 1) / 2, (H - 1) / 2
+        cx, cy = self._pp_cam(p, W)
         us = np.array([0, W - 1, 0, W - 1, cx], float)
         vs = np.array([0, 0, H - 1, H - 1, cy], float)
         pts, hit = ray_sphere(C, pixel_rays(us, vs, C, Rwc, f, cx, cy))
@@ -801,21 +924,22 @@ class Solver:
         returned sigma shows how well the data separate them.
         """
         H, W = shape
-        cx, cy = (W - 1) / 2, (H - 1) / 2
+        cx, cy = self._pp_cam(p, W)
         uv = dm[:, :2].astype(np.float64).copy()
         if p < 0:
             uv[:, 0] = W - 1 - uv[:, 0]
         P = self.cat.points_km(cat_ids)
         sig = 0.06 * dm[:, 2] + 0.5
-        # initial nadir camera above the image centre; image-up azimuth from the 2-D model
-        c_img = np.array([[cx, cy], [cx, cy - 1.0]])
-        if p < 0:
-            c_img[:, 0] = W - 1 - c_img[:, 0]
-        xy_c = model.img_to_tan(c_img)
-        lat_c, lon_c = gnomonic_inv(xy_c[:, 0], xy_c[:, 1], model.lat0, model.lon0)
-        dxy = xy_c[1] - xy_c[0]
-        heading = math.degrees(math.atan2(dxy[0], dxy[1]))
-        km_c = local_scale(model, np.array([cx, cy]))
+        if init is None:
+            # initial nadir camera above the image centre; image-up azimuth from the 2-D model
+            c_img = np.array([[cx, cy], [cx, cy - 1.0]])
+            if p < 0:
+                c_img[:, 0] = W - 1 - c_img[:, 0]
+            xy_c = model.img_to_tan(c_img)
+            lat_c, lon_c = gnomonic_inv(xy_c[:, 0], xy_c[:, 1], model.lat0, model.lon0)
+            dxy = xy_c[1] - xy_c[0]
+            heading = math.degrees(math.atan2(dxy[0], dxy[1]))
+            km_c = local_scale(model, np.array([cx, cy]))
 
         def make_resid(R0, f_fixed):
             def resid(x):

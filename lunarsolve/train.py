@@ -76,6 +76,8 @@ def main():
     ap.add_argument("--wac-frac", type=float, default=0.5)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--init", default=None, help="start from these weights (fresh LR schedule)")
+    ap.add_argument("--no-albedo", action="store_true", help="noise albedo only (no Clementine map)")
     ap.add_argument("--out", default=str(WEIGHTS_PATH))
     args = ap.parse_args()
 
@@ -84,7 +86,11 @@ def main():
     from .terrain import GpuDem
     cat = Catalog()
     dem = GpuDem(dev)
-    rend = DemRenderer(dem, cat, args.size, dev)
+    albedo = None
+    if not args.no_albedo:
+        from .terrain import GpuAlbedo
+        albedo = GpuAlbedo(dev)
+    rend = DemRenderer(dem, cat, args.size, dev, albedo=albedo)
     n_wac = int(round(args.batch * args.wac_frac))
     n_dem = args.batch - n_wac
     loader = iter(torch.utils.data.DataLoader(WacStream(args.size, TRAIN_LON, 0), batch_size=n_wac,
@@ -95,6 +101,8 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=args.iters, pct_start=0.05)
     scaler = torch.amp.GradScaler()
     start = 0
+    if args.init:
+        model.load_state_dict(torch.load(args.init, map_location=dev)["model"])
     if args.resume:
         ck = torch.load(args.out, map_location=dev)
         model.load_state_dict(ck["model"])

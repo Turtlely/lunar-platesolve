@@ -36,7 +36,10 @@ def main():
     ap.add_argument("--alt", type=float, nargs=2, default=(30, 1500))
     ap.add_argument("--fov", type=float, nargs=2, default=(5, 40))
     ap.add_argument("--tilt", type=float, default=20)
+    ap.add_argument("--weights", default=None, help="CraterNet weights file")
     ap.add_argument("--blind-focal", action="store_true")
+    ap.add_argument("--sun", type=float, nargs=2, default=(3, 60), help="dem mode: sun elevation range (deg)")
+    ap.add_argument("--no-albedo", action="store_true", help="dem mode: no Clementine albedo")
     ap.add_argument("--max-time", type=float, default=15)
     ap.add_argument("--min-gsd", type=float, default=None,
                     help="km/px; default 0.1 for wac (mosaic resolution) and 0.5 for dem")
@@ -45,14 +48,20 @@ def main():
     args = ap.parse_args()
 
     s = Solver()
+    if args.weights:
+        from lunarsolve.detect import load_model
+        s._model = load_model(args.weights, device="cuda")
     print(f"solver load {s.load_time:.1f}s, {len(s.index)} quads")
     wac = dem = None
     if args.mode == "wac":
         from lunarsolve.terrain import WacMosaic
         wac = WacMosaic()
+    albedo = None
     if args.mode == "dem":
-        from lunarsolve.terrain import GpuDem
+        from lunarsolve.terrain import GpuAlbedo, GpuDem
         dem = GpuDem()
+        if not args.no_albedo:
+            albedo = GpuAlbedo()
     min_gsd = args.min_gsd if args.min_gsd is not None else {"wac": 0.1, "dem": 0.5}.get(args.mode, 0.0)
     rng = np.random.default_rng(args.seed)
     rows = []
@@ -74,7 +83,7 @@ def main():
             if args.mode == "wac":
                 img = render_wac(wac, v)
             else:
-                img, el, az = render_dem(dem, v, rng)
+                img, el, az = render_dem(dem, v, rng, sun_el_deg=rng.uniform(*args.sun), albedo=albedo)
                 extra = f" sun {el:4.1f}"
             if args.save:
                 import cv2

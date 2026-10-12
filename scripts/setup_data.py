@@ -2,6 +2,7 @@
 
     python scripts/setup_data.py            # catalog + LOLA DEM + index (~0.9 GB download)
     python scripts/setup_data.py --wac      # also the 6 GB LROC WAC mosaic (training / benchmarks)
+    python scripts/setup_data.py --albedo   # also the 4.2 GB Clementine 750 nm albedo mosaic (training)
 
 Files go to $LUNARSOLVE_DATA (default ~/.cache/lunarsolve).
 """
@@ -20,6 +21,7 @@ ROBBINS_URL = ("https://astrogeology.usgs.gov/ckan/dataset/f89f5478-b69a-486c-b9
                "c4f25cc2-4f8a-4207-a845-5e176da3ac5a/download/lunar_crater_database_robbins_2018")
 LDEM_URL = "https://pds-geosciences.wustl.edu/lro/lro-l-lola-3-rdr-v1/lrolol_1xxx/data/lola_gdr/cylindrical/img/ldem_64.img"
 WAC_URL = "https://planetarymaps.usgs.gov/mosaic/Lunar_LRO_LROC-WAC_Mosaic_global_100m_June2013.tif"
+CLEMENTINE_URL = "https://planetarymaps.usgs.gov/mosaic/Lunar_Clementine_UVVIS_750nm_Global_Mosaic_118m_v2.1.tif"
 
 
 def fetch(url, dest):
@@ -42,6 +44,7 @@ def fetch(url, dest):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wac", action="store_true", help="also download the LROC WAC 100 m mosaic (6 GB)")
+    ap.add_argument("--albedo", action="store_true", help="also download the Clementine 750 nm mosaic (4.2 GB)")
     args = ap.parse_args()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not CATALOG_CSV.exists():
@@ -56,6 +59,12 @@ def main():
         fetch(LDEM_URL, LDEM_IMG)
     if args.wac and not WAC_TIF.exists():
         fetch(WAC_URL, WAC_TIF)
+    if args.albedo:
+        from lunarsolve.terrain import ALBEDO_NPY, ALBEDO_TIF, build_albedo_64
+        if not ALBEDO_TIF.exists():
+            fetch(CLEMENTINE_URL, ALBEDO_TIF)
+        if not ALBEDO_NPY.exists():
+            build_albedo_64()
     from lunarsolve.catalog import Catalog
     cat = Catalog()
     print(f"catalog: {len(cat)} craters; computing rim elevations")

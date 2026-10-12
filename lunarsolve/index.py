@@ -25,8 +25,8 @@ M_NEAR = 9
 Q_PER_CELL = 6
 
 
-def level_band(l):
-    lo = S0 * math.sqrt(2) ** l
+def level_band(l, s0=S0):
+    lo = s0 * math.sqrt(2) ** l
     return lo, lo * math.sqrt(2)
 
 
@@ -85,13 +85,14 @@ def _build_level(cells, ptr, nbr, xyz, rad, M, Q, s_lo, s_hi):
     return out_ids, out_codes
 
 
-def build(cat=None, verbose=True):
+def build(cat=None, verbose=True, s0=S0, n_levels=N_LEVELS, dmin_floor=1.0, path=INDEX_PATH):
+    """Build the index.  The fine catalog uses s0 = 8/2**1.5 km (3 extra levels) and a 0.6 km floor."""
     cat = cat or Catalog()
     all_ids, all_codes, all_lvl = [], [], []
-    for l in range(N_LEVELS):
+    for l in range(n_levels):
         t0 = time.time()
-        s_lo, s_hi = level_band(l)
-        dmin = max(1.0, s_lo / 30)
+        s_lo, s_hi = level_band(l, s0)
+        dmin = max(dmin_floor, s_lo / 30)
         dmax = s_hi * 0.7
         pool = np.nonzero((cat.diam >= dmin) & (cat.diam <= dmax))[0]      # largest first
         spacing = s_lo / 1.5
@@ -118,7 +119,7 @@ def build(cat=None, verbose=True):
         if verbose:
             print(f"level {l:2d} |AB| {s_lo:7.1f}-{s_hi:7.1f} km  pool {len(pool):8d}  cells {n_cells:8d}  "
                   f"quads {len(ids):8d}  {time.time() - t0:.1f}s", flush=True)
-    np.savez(INDEX_PATH, ids=np.concatenate(all_ids), codes=np.concatenate(all_codes),
+    np.savez(path, ids=np.concatenate(all_ids), codes=np.concatenate(all_codes),
              level=np.concatenate(all_lvl))
 
 
@@ -135,4 +136,13 @@ class QuadIndex:
 
 
 if __name__ == "__main__":
-    build()
+    import argparse
+    from .config import FINE_CATALOG_NPZ, FINE_INDEX_PATH
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fine", action="store_true", help="build the index of the fine catalog")
+    a = ap.parse_args()
+    if a.fine:
+        build(Catalog(FINE_CATALOG_NPZ), s0=S0 / 2 ** 1.5, n_levels=N_LEVELS + 3, dmin_floor=0.6,
+              path=FINE_INDEX_PATH)
+    else:
+        build()

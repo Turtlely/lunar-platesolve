@@ -1,0 +1,26 @@
+# systemd unit for the API without Docker (Linux, Python 3.12 virtual environment).
+#
+#   sudo useradd -r -m -d /opt/lunarsolve lunarsolve
+#   (copy the code to /opt/lunarsolve/app, create /opt/lunarsolve/app/.venv, install
+#    deploy/server/requirements.txt and CPU torch, run server/fetch_data.py as that user)
+#   sudo cp deploy/server/lunarsolve-api.service /etc/systemd/system/
+#   sudo systemctl enable --now lunarsolve-api
+#
+# The API listens on 127.0.0.1:8000; put a reverse proxy with HTTPS (Caddy, nginx) or a
+# Cloudflare Tunnel in front of it.
+[Unit]
+Description=Lunar plate solver API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=lunarsolve
+WorkingDirectory=/opt/lunarsolve/app
+Environment=LUNARSOLVE_DATA=/opt/lunarsolve/data
+Environment=OMP_NUM_THREADS=4
+ExecStart=/opt/lunarsolve/app/.venv/bin/python server/api.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
