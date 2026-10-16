@@ -232,7 +232,7 @@ def to_rgb(bgr):
 def gazetteer():
     if "gaz" not in _state:
         from lunarsolve.names import Gazetteer
-        _state["gaz"] = Gazetteer()
+        _state["gaz"] = Gazetteer(catalog=solver().cat)
     return _state["gaz"]
 
 

@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--fov", type=float, nargs=2, default=(5, 40))
     ap.add_argument("--tilt", type=float, default=20)
     ap.add_argument("--weights", default=None, help="CraterNet weights file")
+    ap.add_argument("--catalog", default=None, help="crater catalog npz (default: Robbins)")
+    ap.add_argument("--index", default=None, help="quad index npz matching --catalog")
+    ap.add_argument("--multi", action="store_true", help="Robbins, then the CraterNet catalog (lunarsolve.multi)")
     ap.add_argument("--blind-focal", action="store_true")
     ap.add_argument("--sun", type=float, nargs=2, default=(3, 60), help="dem mode: sun elevation range (deg)")
     ap.add_argument("--no-albedo", action="store_true", help="dem mode: no Clementine albedo")
@@ -47,7 +50,15 @@ def main():
     ap.add_argument("--save", default=None, help="directory to save rendered test images")
     args = ap.parse_args()
 
-    s = Solver()
+    if args.multi:
+        from lunarsolve.multi import default_solver
+        s = default_solver()
+    elif args.catalog:
+        from lunarsolve.catalog import Catalog
+        from lunarsolve.index import QuadIndex
+        s = Solver(catalog=Catalog(Path(args.catalog)), index=QuadIndex(Path(args.index)))
+    else:
+        s = Solver()
     if args.weights:
         from lunarsolve.detect import load_model
         s._model = load_model(args.weights, device="cuda")

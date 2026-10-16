@@ -35,7 +35,8 @@ def assemble(build, data_repo):
         shutil.copy(ROOT / "server" / f, build / "server" / f)
     (build / "server" / "__init__.py").write_text("")
     (build / "weights").mkdir()
-    shutil.copy(ROOT / "weights" / "craternet.pt", build / "weights" / "craternet.pt")
+    for w in ("craternet.pt", "craternet_v3.pt"):
+        shutil.copy(ROOT / "weights" / w, build / "weights" / w)
     (build / "data_repo.txt").write_text(data_repo + "\n")
     return build
 

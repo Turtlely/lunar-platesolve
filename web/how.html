@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>How it works · Lunar Plate Solver</title>
-  <meta name="description" content="How the lunar plate solver finds the camera position from craters.">
+  <meta name="description" content="How the lunar plate solver finds the camera position from craters: detector, crater-pattern hashing, index, statistical verification, camera fit.">
   <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -13,7 +13,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
           onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '\\(', right: '\\)', display: false}]})"></script>
-  <link rel="stylesheet" href="style.css?v=4">
+  <link rel="stylesheet" href="style.css?v=7">
 </head>
 <body>
   <header class="top">
@@ -29,12 +29,18 @@
 
     <ol class="toc">
       <li><a href="#overview">Overview</a></li>
-      <li><a href="#detect">Finding craters</a></li>
-      <li><a href="#quads">Crater patterns</a></li>
-      <li><a href="#index">The index</a></li>
-      <li><a href="#verify">Checking a match</a></li>
-      <li><a href="#camera">The camera position</a></li>
-      <li><a href="#horizon">Tilted views</a></li>
+      <li><a href="#t-frames">Frames and camera model</a></li>
+      <li><a href="#t-detect">Crater detection (CraterNet)</a></li>
+      <li><a href="#t-hash">The crater-pattern hash</a></li>
+      <li><a href="#t-index">The index</a></li>
+      <li><a href="#t-search">Search order</a></li>
+      <li><a href="#t-verify">Verification: log-odds</a></li>
+      <li><a href="#t-camera">Camera fit and uncertainty</a></li>
+      <li><a href="#t-limb">Oblique views: the limb cone</a></li>
+      <li><a href="#t-far">Far views: the disk</a></li>
+      <li><a href="#t-catalog">Our own crater catalog</a></li>
+      <li><a href="#t-rig">Several cameras (rig)</a></li>
+      <li><a href="#t-dense">Dense registration</a></li>
       <li><a href="#accuracy">Accuracy</a></li>
       <li><a href="#limits">Limits</a></li>
       <li><a href="#api">API</a></li>
@@ -47,171 +53,303 @@
       The output is the camera latitude, longitude and altitude, the direction the camera pointed, and the
       latitude and longitude of every pixel.</p>
     <ol class="flow">
-      <li><b>Image</b><span>any lighting</span></li>
       <li><b>Find craters</b><span>neural network</span></li>
-      <li><b>Make patterns</b><span>4 craters each</span></li>
-      <li><b>Look up</b><span>8.6 million patterns</span></li>
-      <li><b>Check and fit</b><span>camera position</span></li>
+      <li><b>Hash patterns</b><span>4 craters → 8 numbers</span></li>
+      <li><b>Look up</b><span>8.6 M patterns, k-d tree</span></li>
+      <li><b>Verify</b><span>log-odds against chance</span></li>
+      <li><b>Fit camera</b><span>robust least squares</span></li>
     </ol>
-    <p>A typical solve takes a few seconds. The search stops when a match passes the statistical check, or when
-      the time limit is reached.</p>
+    <p>The method follows <a href="https://astrometry.net/">astrometry.net</a>, the blind star-field solver, with
+      craters in place of stars and crater diameter in place of brightness. Two things are new compared with
+      stars: craters have a size, which the hash uses; and the Moon is a nearby sphere seen in perspective, not a
+      celestial sphere at infinity, so the last step fits a full 3-D camera.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="detect">1. Finding craters</h2>
-    <p>A convolutional neural network, CraterNet, finds the centre and the radius of each crater. It is a
-      U-Net with 6.2 million parameters. For each output pixel (half the input resolution) it gives three
-      things: the probability of a crater centre, the sub-pixel offset of the centre, and the logarithm of the
-      radius.</p>
-    <p>The main difficulty is the sun. The same crater looks completely different at sunrise, at noon, and from
-      the other side. So the network is trained only on images with known craters under many kinds of
-      lighting:</p>
+    <h2 id="t-frames">1. Frames and camera model</h2>
+    <p>Positions are in the Moon-fixed (mean Earth / polar axis) frame: origin at the Moon's centre, \(z\) to
+      the north pole, \(x\) to latitude 0°, longitude 0°. The mean radius is \(R = 1737.4\) km. A point at
+      latitude \(\varphi\), longitude \(\lambda\) and height \(h\) is</p>
+    $$\mathbf{X} = (R + h)\,\big(\cos\varphi\cos\lambda,\; \cos\varphi\sin\lambda,\; \sin\varphi\big).$$
+    <p>The camera is a pinhole with centre \(\mathbf{C}\), rotation \(R_{wc}\) (world to camera; camera axes
+      \(x\) right, \(y\) down, \(z\) along the boresight), focal length \(f\) in pixels and principal point
+      \((c_x, c_y)\):</p>
+    $$\mathbf{X}_c = R_{wc}(\mathbf{X} - \mathbf{C}), \qquad
+      \pi(\mathbf{X}) = \Big(c_x + f\,\tfrac{X_c}{Z_c},\;\; c_y + f\,\tfrac{Y_c}{Z_c}\Big).$$
+    <p>The altitude is \(|\mathbf{C}| - R\). The inverse, pixel to latitude/longitude, intersects the ray
+      \(\mathbf{C} + t\,R_{wc}^{\top}\big((u-c_x)/f,\,(v-c_y)/f,\,1\big)\) with the LOLA terrain (fixed-point
+      iteration on the sphere of radius \(R + h(\varphi, \lambda)\)), not with the mean sphere: in an oblique
+      view the mean sphere is off by \(h\tan\theta\) at viewing angle \(\theta\).</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="t-detect">2. Crater detection (CraterNet)</h2>
+    <p><b>Network.</b> A U-Net with residual blocks: encoder widths 24, 32, 64, 128, 192, 256 channels,
+      6.2 million parameters, output at stride 2 (half the input resolution). Each output cell gives</p>
     <ul>
-      <li>the LOLA elevation model of the whole Moon, rendered with a random sun from 1.5° to 89° above the
-        horizon, with cast shadows and real surface brightness (Clementine 750 nm albedo);</li>
-      <li>crops of the LRO Wide Angle Camera mosaic (real images at 100 m per pixel);</li>
-      <li>random noise, blur, contrast and camera tilt.</li>
+      <li>\(\hat Y\): probability that a crater centre is in the cell (sigmoid of a logit),</li>
+      <li>\((\delta_x, \delta_y)\): sub-cell offset of that centre,</li>
+      <li>\(\ln \hat r\): logarithm of the radius in input pixels.</li>
     </ul>
-    <p>The training labels come from the crater catalog. One region of the Moon (longitude 330°–360°) is kept
-      out of training, to test the network on terrain it has never seen. Large craters are found on reduced
-      copies of the image (an image pyramid), so one network covers radii from 3 pixels to hundreds of
-      pixels.</p>
+    <p><b>Targets and loss</b> (CenterNet style). For a crater at cell position \(\tilde{\mathbf{p}}\) with radius
+      \(r\), the heatmap target is a Gaussian of width \(\sigma = \max(0.6,\, r/8)\) cells,
+      \(Y_{\mathbf{q}} = \max_k \exp\!\big(-\lVert\mathbf{q} - \tilde{\mathbf{p}}_k\rVert^2 / 2\sigma_k^2\big)\).
+      The heatmap loss is the penalty-reduced focal loss with \(\alpha = 2\), \(\beta = 4\):</p>
+    $$L_{\text{hm}} = -\frac{1}{N}\sum_{\mathbf{q}}
+      \begin{cases}(1-\hat Y_{\mathbf{q}})^{\alpha}\,\ln \hat Y_{\mathbf{q}} & Y_{\mathbf{q}} = 1\\[2pt]
+      (1-Y_{\mathbf{q}})^{\beta}\,\hat Y_{\mathbf{q}}^{\alpha}\,\ln(1-\hat Y_{\mathbf{q}}) & \text{otherwise}\end{cases}$$
+    <p>plus L1 losses on the offset and on \(\ln r\) at the true centres. Craters outside the band of radii that a
+      pyramid level is trained for are masked ("ignore" regions): they are not targets, and detections on them
+      are not punished.</p>
+    <p><b>Training data.</b> Generated on the GPU, with labels from the crater catalog: (a) the LOLA elevation
+      model rendered with a random sun (elevation drawn from 1.5°–89°), cast shadows, Lunar-Lambert reflectance
+      with the McEwen phase function \(L(g) = 1 - 0.019g + 2.42\cdot10^{-4}g^2 - 1.46\cdot10^{-6}g^3\), and
+      Clementine 750 nm albedo; (b) crops of the LRO WAC mosaic; (c) noise, blur, contrast and tilt. Longitudes
+      330°–360° are held out for testing.</p>
+    <p><b>Inference.</b> An image pyramid (factor 2 per level) covers all sizes: level 0 keeps radii 3–36 px, the
+      other levels 14–36 px, the last level up to 48 px. Cells with \(\hat Y \ge 0.3\) that are local maxima give
+      detections; non-maximum suppression removes duplicates closer than \(0.4\,r\) with
+      \(|\Delta \ln r| < 0.35\). The solver uses detections with \(\hat Y \ge 0.35\).</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="quads">2. Crater patterns</h2>
-    <p>One crater alone says almost nothing. Four craters together make a pattern that is rare enough to look
-      up. The solver uses the idea of <a href="https://astrometry.net/">astrometry.net</a>: describe each group
-      of four by a short code that does not change when the image is moved, turned or scaled.</p>
+    <h2 id="t-hash">3. The crater-pattern hash</h2>
+    <p>A <em>quad</em> is four craters A, B, C, D in which C and D lie inside the circle that has AB as its
+      diameter; so A and B are the pair farthest apart. With image (or map) positions \(\mathbf{a}, \mathbf{b},
+      \mathbf{c}, \mathbf{d}\) and \(\mathbf{e} = \mathbf{b} - \mathbf{a}\), the positions of C and D in the frame
+      where A is \((0, 0)\) and B is \((1, 0)\) are</p>
+    $$x_C = \frac{(\mathbf{c}-\mathbf{a})\cdot\mathbf{e}}{\lVert\mathbf{e}\rVert^2}, \qquad
+      y_C = \frac{\mathbf{e}\times(\mathbf{c}-\mathbf{a})}{\lVert\mathbf{e}\rVert^2},$$
+    <p>and the same for D (\(\times\) is the 2-D cross product). These four numbers do not change under
+      translation, rotation and scaling of the image.</p>
     <figure>
-      <svg viewBox="0 0 400 250" role="img" aria-label="A crater quad: the two farthest craters A and B define a frame; C and D are given in that frame" style="max-width: 440px">
+      <svg viewBox="20 -22 380 300" role="img" aria-label="A crater quad: A and B define a frame; C and D lie inside the circle with diameter AB" style="max-width: 440px">
+        <circle cx="210" cy="125" r="141.5" fill="none" stroke="var(--muted)" stroke-dasharray="4 4"/>
+        <line x1="90" y1="200" x2="330" y2="50" stroke="var(--muted)" stroke-dasharray="4 4"/>
         <g class="svg-line" stroke-width="1.4">
           <circle cx="90" cy="200" r="22"/><circle cx="330" cy="50" r="30"/><circle cx="160" cy="95" r="14"/><circle cx="270" cy="170" r="18"/>
         </g>
-        <g stroke="var(--muted)" stroke-dasharray="4 4" fill="none">
-          <line x1="90" y1="200" x2="330" y2="50"/><rect x="90" y="50" width="240" height="150"/>
-        </g>
-        <g class="svg-text"><text x="56" y="236">A (0, 0)</text><text x="300" y="16">B (1, 1)</text><text x="132" y="74">C</text><text x="292" y="196">D</text></g>
+        <g class="svg-text"><text x="40" y="240">A (0, 0)</text><text x="300" y="14">B (1, 0)</text><text x="134" y="76">C</text><text x="292" y="196">D</text></g>
       </svg>
-      <figcaption>A and B are the two craters farthest apart. They define a frame with A at (0, 0) and B at (1, 1).
-        The positions of C and D in that frame are 4 numbers that do not change with position, rotation or
-        scale. The crater sizes relative to the group give 4 more numbers.</figcaption>
+      <figcaption>A and B define the frame. C and D must lie inside the circle on AB (dashed); their frame
+        coordinates are the first four numbers of the code.</figcaption>
     </figure>
-    <p>The four position numbers are \((x_C, y_C, x_D, y_D)\). The other four numbers use the crater radii,
-      which the shape alone ignores. With \(m\) the mean of \(\ln r\) over the four craters:</p>
-    $$\mathbf{c} = \big(x_C,\; y_C,\; x_D,\; y_D,\; w_R(\ln r_A - m),\; w_R(\ln r_B - m),\; w_R(\ln r_C - m),\; w_S(m - \ln|AB|)\big)$$
-    <p>The weights \(w_R = 0.30\) and \(w_S = 0.15\) scale the radius terms to the noise of the detector, so all
-      8 numbers have about the same uncertainty. Swapping A with B, or C with D, gives the same group, so the
-      solver tries all the equivalent orders.</p>
+    <p><b>Canonical order.</b> The same four craters can be labelled in several ways. The labelling is fixed by
+      two rules: if \(x_C + x_D > 1\), swap A and B (which maps \(x \to 1-x,\ y \to -y\)); then if \(x_C > x_D\),
+      swap C and D.</p>
+    <p><b>Sizes.</b> Unlike stars, craters have a radius. With \(m\) the mean of \(\ln r\) over the four craters,
+      the code adds the relative radii and the size of the craters relative to their spacing:</p>
+    $$\begin{aligned}\mathbf{k} = \Big(&x_C,\; y_C,\; x_D,\; y_D,\\
+      &w_R(\ln r_A - m),\; w_R(\ln r_B - m),\; w_R(\ln r_C - m),\; w_S\big(m - \ln\lVert\mathbf{e}\rVert\big)\Big) \in \mathbb{R}^8.\end{aligned}$$
+    <p>The \(D\) radius term is left out because the four terms sum to zero. The weights whiten the noise: the
+      position terms have a typical error of about 0.02, and \(\ln r\) about 0.08, so \(w_R = 0.30\) makes the
+      radius terms comparable; \(w_S = 0.15\) is smaller because it also absorbs any bias of the detector's radii.
+      The weights and the match tolerance came from a sweep of recall against false hits.</p>
+    <p><b>Near a boundary.</b> If \(|x_C + x_D - 1| < 2\tau\) or \(|x_C - x_D| < 2\tau\), noise may have flipped the
+      labelling relative to the index, so the solver also queries the swapped variants.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="index">3. The index</h2>
-    <p>The catalog is the Robbins (2019) database: 1.3 million craters of 1 km and larger, for the whole Moon.
-      From it the solver builds an index of crater patterns, once, ahead of time:</p>
+    <h2 id="t-index">4. The index</h2>
+    <p>The catalog is the Robbins (2019) database: 1,296,796 craters of 1–2 km and larger. The index is built once.</p>
     <ul>
-      <li>15 size bands, from patterns about 8 km across to patterns of hundreds of km, each band
-        \(\sqrt{2}\) larger than the one before;</li>
-      <li>in each band, groups of four neighbouring craters of matching size, at evenly spaced points over the
-        whole sphere;</li>
-      <li>8.6 million patterns in total, stored in a k-d tree for fast nearest-neighbour search in 8
-        dimensions.</li>
+      <li><b>Size bands.</b> Band \(l = 0, \dots, 14\) holds quads with \(\lVert AB\rVert \in
+        [S_0\,2^{l/2},\; S_0\,2^{(l+1)/2})\), \(S_0 = 8\) km: from 8 km to about 1,400 km.</li>
+      <li><b>Even coverage.</b> In each band, \(n = 4\pi R^2 / s^2\) sample points with spacing
+        \(s = S_0 2^{l/2} / 1.5\) are placed on a Fibonacci lattice: point \(k\) has
+        \(z_k = 1 - \frac{2k+1}{n}\) and longitude \(k \cdot \pi(3 - \sqrt5)\) (the golden angle).</li>
+      <li><b>Brightest stars per cell.</b> At each point, the \(M = 9\) largest nearby craters of a size suited to the
+        band form up to \(Q = 6\) quads, in gnomonic (tangent-plane) coordinates around the point:
+        $$x = \frac{\cos\varphi\,\sin(\lambda-\lambda_0)}{\cos c},\quad
+          y = \frac{\cos\varphi_0\sin\varphi - \sin\varphi_0\cos\varphi\cos(\lambda-\lambda_0)}{\cos c},$$
+        \(\cos c = \sin\varphi_0\sin\varphi + \cos\varphi_0\cos\varphi\cos(\lambda-\lambda_0)\).</li>
+      <li><b>Result.</b> 8.6 million quads; their codes go into a k-d tree. A query returns every index code within
+        Euclidean distance \(\tau = 0.08\) of the image code.</li>
     </ul>
-    <p>To search, the solver makes patterns from the largest and clearest craters in the image, computes their
-      codes, and asks the tree for catalog patterns with a code within a small distance (0.08). Every answer is a
-      <em>hypothesis</em>: "these four image craters are those four catalog craters".</p>
+    <p>Row numbers in the index refer to the catalog sorted by diameter. Many diameters are equal, and the default
+      sort of NumPy orders equal values differently on different CPUs, so the order is stored once with the
+      data.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="verify">4. Checking a match</h2>
-    <p>Most hypotheses are wrong: with millions of patterns, some codes agree by chance. A hypothesis is
-      accepted only when the rest of the image agrees with it. The four matched craters give a map from the
-      image to the Moon. That map predicts where every other catalog crater must appear in the image. Then the
-      solver counts:</p>
-    <ul>
-      <li>predicted craters that are found in the image (each one is evidence for the match), and</li>
-      <li>predicted craters that are missing (each one is evidence against it, unless it is too small to be
-        detected).</li>
-    </ul>
-    <p>The evidence is summed as log-odds, like in astrometry.net:</p>
-    $$\Lambda = \sum_{i} \ln \frac{P(\text{observation}_i \mid \text{true match})}{P(\text{observation}_i \mid \text{chance})}$$
-    <p>A match is accepted when \(\Lambda \ge 60\), which means odds of more than \(10^{26}\) to 1 against
-      chance. A weaker match (\(\Lambda \ge 18\)–\(25\)) is accepted only when at least 10 craters agree and the
-      largest craters of the image are among them. These rules came from tests on thousands of simulated views:
-      the solver gives no answer rather than a wrong one.</p>
+    <h2 id="t-search">5. Search order</h2>
+    <p>Query quads come cheapest-first from three sources, interleaved:</p>
+    <ol>
+      <li>the \(N\) largest detections, \(N = 8, 11, 14, 18, 23, 30, 40\) (like the brightest stars);</li>
+      <li>a local rule that mirrors the index: at each pixel scale, a grid of cells and the few largest suitable
+        detections in each cell;</li>
+      <li>"oblique" guesses: before hashing, undo an assumed foreshortening (tilt 20°–55° toward six azimuths),
+        for strongly tilted views.</li>
+    </ol>
+    <p>For each query, hits are tested in order of code distance (true matches sit near distance 0, chance hits fill
+      the tolerance ball uniformly and pile up near its edge). Each image is tried as taken and mirrored.
+      A vectorised pre-filter rejects most hits cheaply: it predicts where neighbouring catalog craters
+      should appear and requires at least 3 of 12 to be found, using k-d trees binned by \(\ln\) diameter.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="camera">5. The camera position</h2>
-    <p>The matched craters are points on the Moon with known 3-D positions (latitude, longitude, and the height
-      of the crater rim from the LOLA elevation model). Their image positions fix the camera. The solver fits a
-      pinhole camera with 6 unknowns, position and pointing, by a robust least-squares fit (perspective-n-point).</p>
-    <figure>
-      <svg viewBox="0 0 480 230" role="img" aria-label="Camera above the surface; altitude from the apparent size of craters" style="max-width: 520px">
-        <path class="svg-line" stroke-width="1.4" d="M10 200 Q240 165 470 200"/>
-        <g class="svg-line" stroke-width="1.2"><ellipse cx="150" cy="184" rx="34" ry="6"/><ellipse cx="360" cy="184" rx="22" ry="4"/></g>
-        <g stroke="var(--muted)" stroke-dasharray="4 4"><line x1="250" y1="40" x2="116" y2="184"/><line x1="250" y1="40" x2="184" y2="184"/><line x1="250" y1="40" x2="250" y2="178"/></g>
-        <rect x="234" y="22" width="32" height="20" rx="3" class="svg-box" style="stroke: var(--text)"/>
-        <g class="svg-text"><text x="274" y="36">camera</text><text x="258" y="120">altitude</text><text x="104" y="218">crater, diameter D</text></g>
-      </svg>
-      <figcaption>Distance from the camera to a crater ≈ f · D / d, with f the focal length in pixels and d the
-        crater's diameter in the image.</figcaption>
-    </figure>
-    <p>Position along the ground comes from where the craters are. Altitude comes from how large they look: a
-      crater of diameter \(D\) that is \(d\) pixels wide in an image with focal length \(f\) pixels is about
-      \(f D / d\) away. If the field of view is unknown, the solver tries 10 values from 0.5° to 120°, keeps the
-      best fit and refines it. Then the altitude is less certain, because a camera far away with a narrow lens
-      gives almost the same image as a camera close by with a wide lens. Tilted views and long footprints
-      separate the two.</p>
-    <p>The result has a 1-sigma uncertainty from the fit. In simulations, the true position is inside 2 sigma in
-      about 9 of 10 cases.</p>
+    <h2 id="t-verify">6. Verification: log-odds</h2>
+    <p>A hit is a hypothesis: "these four image craters are those four catalog craters". It gives a map from the
+      image to the gnomonic plane around the quad. The map grows with the support: a similarity at first, then an
+      affine map, then a homography, over neighbourhoods of 2, 4 and 8 times \(\lVert AB\rVert\), then the whole image.
+      Through the map, every catalog crater predicts a position and radius in the image.</p>
+    <p>Detection \(i\) (radius \(r_i\) px, implied diameter \(d_i = 2 r_i s\) km at \(s\) km/px) is matched when a
+      predicted crater lies within \(\tau_i = \max(0.5\,r_i,\, 2\text{ px})\) and \(|\ln(r_{\text{cat}}/r_i)| < 0.4\).
+      The two hypotheses are compared per detection:</p>
+    $$p_{\text{bg},i} = \operatorname{clip}\!\left(\frac{n_i\,\pi\tau_i^2}{A},\ 10^{-4},\ 0.9\right), \qquad
+      p_{\text{m},i} = 0.6\cdot\operatorname{clip}\!\left(\frac{d_i - d_0}{d_1 - d_0},\ 0.15,\ 1\right),$$
+    <p>where \(n_i\) is the number of catalog craters in view with a radius similar to \(r_i\), \(A\) the image
+      area, and \((d_0, d_1) = (0.7, 2.5)\) km the catalog's completeness ramp (the probability that a real crater
+      of that size is in the catalog). The evidence is</p>
+    $$\Lambda = \sum_{i\ \in\ \text{matched}} \ln\frac{p_{\text{m},i}}{p_{\text{bg},i}}
+      \;+\; \sum_{i\ \notin\ \text{matched}} \ln\frac{1 - p_{\text{m},i}}{1 - p_{\text{bg},i}}.$$
+    <p>Detections below the catalog's completeness carry no evidence, and neither do detections that the camera sees
+      more than 60° from the surface normal: there craters are thin ellipses, the detector misses many of them and
+      gives radii that do not match.</p>
+    <table>
+      <tr><th>Accept when</th><th>Meaning</th></tr>
+      <tr><td>\(\Lambda \ge 60\)</td><td>odds above \(e^{60} \approx 10^{26}\) to 1 against chance</td></tr>
+      <tr><td>\(\Lambda \ge 25\), \(\ge 10\) matches, \(\ge 45\%\) of the 20 largest detections matched</td><td>a moderate match that also explains the big craters</td></tr>
+      <tr><td>\(\Lambda \ge 18\), \(\ge 10\) matches, \(\ge 70\%\) of the 20 largest matched</td><td>weak, but covers the dominant craters</td></tr>
+    </table>
+    <p>These rules came from tests on thousands of simulated views; the solver gives no answer rather than a wrong
+      one. The final \(\Lambda\) is measured after the camera fit, so it is optimistic; that is why the coverage
+      of the largest craters is required for weaker matches.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="horizon">6. Tilted views and the horizon</h2>
-    <p>In a strongly tilted view, craters far away are squashed into thin ellipses, and the patterns change
-      shape. When the edge of the Moon is in the image, the solver uses it: the edge is a circle on the sky,
-      and its curvature and position give the camera tilt and altitude directly. The solver then re-projects the
-      image to a straight-down view and solves that view as usual.</p>
+    <h2 id="t-camera">7. Camera fit and uncertainty</h2>
+    <p>Each matched crater \(i\) gives a 3-D point \(\mathbf{X}_i\): the catalog centre lifted to \(R + h_i\), where
+      \(h_i\) is the mean LOLA height of 12 points on the crater's rim (what the detector sees). The pose is the
+      robust least-squares solution (perspective-n-point)</p>
+    $$\min_{\mathbf{C},\ \boldsymbol{\omega}\ [,\, f]}\ \sum_i \rho\!\left(\frac{\lVert \pi(\mathbf{X}_i) - \mathbf{u}_i\rVert^2}{(2\sigma_i)^2}\right),
+      \qquad \sigma_i = 0.06\,r_i + 0.5\ \text{px}, \qquad \rho(z) = 2\big(\sqrt{1+z} - 1\big),$$
+    <p>with the rotation updated through a rotation vector \(\boldsymbol\omega\) (Rodrigues) and \(\rho\) the soft-L1
+      loss with scale 2: quadratic for small residuals and linear for large ones, so wrong matches pull
+      less. Large craters get a larger \(\sigma_i\) because their detected
+      centre is less precise.</p>
+    <p><b>Unknown focal length.</b> A camera far away with a narrow lens and a camera close by with a wide lens
+      give nearly the same image: in \(\pi\), \(f\) and the distance \(Z_c\) appear only as \(f/Z_c\). The solver
+      therefore profiles the fit over 10 fixed fields of view from 0.5° to 120° (log-spaced), refines around the
+      best one by factors 0.6–1.6, re-matches all detections through each camera, and then frees \(f\).</p>
+    <p><b>Uncertainty.</b> From the Jacobian \(J\) at the optimum, \(\Sigma = (J^\top J)^{-1}\,\hat s^2\) with
+      \(\hat s^2\) the residual variance. The altitude 1-sigma is \(\sigma_{\text{alt}} = \sqrt{\hat{\mathbf{z}}^\top
+      \Sigma_C \hat{\mathbf{z}}}\) (\(\hat{\mathbf{z}} = \mathbf{C}/|\mathbf{C}|\)), and the horizontal one the
+      trace of \(\Sigma_C\) projected on the tangent plane. Without the focal length, \(\sigma_{\text{alt}}\) is at
+      least half the spread of altitudes over the profile points that fit almost as well.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="accuracy">7. Accuracy</h2>
-    <p>Tests on real spacecraft images and on simulated views (the solver had no position hint in any test):</p>
+    <h2 id="t-limb">8. Oblique views: the limb cone</h2>
+    <p>From \(\mathbf{C}\), the limb is the set of rays tangent to the sphere: a cone around the direction
+      \(\hat{\mathbf a}\) to the Moon's centre with half-angle \(\rho\),</p>
+    $$\sin\rho = \frac{R_{\text{limb}}}{|\mathbf{C}|}, \qquad \hat{\mathbf d}\cdot\hat{\mathbf a} = \cos\rho \ \text{ for every limb ray } \hat{\mathbf d},$$
+    <p>with \(R_{\text{limb}} = R + 1.5\) km (the silhouette is formed by high terrain). Limb pixels are found on the
+      boundary with dark sky; RANSAC fits \((\hat{\mathbf a}, \rho)\) for a few candidate focal lengths. That gives
+      the tilt and the altitude \(|\mathbf{C}| - R\). The image is then re-projected to a virtual camera at the same
+      point looking straight down, a pure rotation, so the homography \(H = K_v R_{vc} K^{-1}\); craters are round
+      again and the normal solver runs on that view. The crater altitude must agree with the limb altitude within 20%.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="t-far">9. Far views: the disk</h2>
+    <p>A telescope on Earth or a spacecraft thousands of km away sees the whole disk, or part of its edge. The
+      lit limb is a circle in the image with centre \(\mathbf{c}\) and radius \(r\) px, found by RANSAC on the sharp
+      part of the boundary with the sky (the terminator is soft and is ignored). For a camera at distance \(D\)
+      from the Moon's centre with focal length \(f\),</p>
+    $$\sin\rho = \frac{R}{D}, \qquad r = f\tan\rho \quad\Longrightarrow\quad D = \frac{R}{\sin\big(\arctan(r/f)\big)}.$$
+    <p>Each pixel inside the circle then maps to exactly one surface point: intersect its ray with the sphere. In
+      camera axes that point has the unit vector \(\mathbf{n}(u, v)\); for a distant camera,
+      \(\mathbf{n} \approx \big(q_x,\, q_y,\, -\sqrt{1 - q_x^2 - q_y^2}\big)\) with \(\mathbf q = (\mathbf u - \mathbf c)/r\).
+      A catalog crater with Moon-frame unit vector \(\mathbf{p}\) appears where \(\mathbf{n} = R_{wc}\mathbf{p}\), so the
+      rotation follows in closed form from the matched pairs (Kabsch / Wahba):</p>
+    $$H = \sum_i w_i\, \mathbf{p}_i \mathbf{n}_i^{\top} = U S V^{\top}, \qquad
+      R_{wc} = V\,\operatorname{diag}\!\big(1,\, 1,\, \det(V U^{\top})\big)\,U^{\top}.$$
+    <p>Because this is the exact sphere, a match in one region extends correctly to the whole disk. A short limb
+      arc (a close-up) fixes the circle only to a few percent, so the rotation and the circle are then refined
+      together on the craters and the limb points:</p>
+    $$\min_{R_{wc},\, \mathbf{c},\, r}\ \sum_i \rho\!\left(\frac{\lVert \pi(R_{wc}\mathbf{p}_i;\, \mathbf c, r) - \mathbf{u}_i\rVert^2}{\sigma_i^2}\right)
+      + \sum_j \rho\!\left(\frac{(\lVert \mathbf{l}_j - \mathbf{c}\rVert - r)^2}{\sigma_{\text{limb}}^2}\right).$$
+    <p>A close-up near the limb is first re-projected to a straight-down view over its centre, where craters are
+      round, solved there, and mapped back. <b>Distance:</b> with the field of view, \(D\) follows from the formula
+      above. Without it, a far view does not determine \(D\) (between 50,000 and 400,000 km the image changes by
+      less than 0.1%), and the result says so. The direction the camera looked from (the sub-observer point) is
+      always measured.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="t-catalog">Our own crater catalog</h2>
+    <p>The hash uses the largest craters the detector finds, like the brightest stars. An index built from a catalog
+      made by other means contains many craters that the detector does not see: in the LRO WAC mosaic it finds only
+      41% of the 1–2 km and 33% of the 2–5 km Robbins craters (degraded rims, high sun). Patterns built from those
+      craters can never match an image.</p>
+    <p>So the detector also built a catalog. It read the whole Moon in nine passes: the WAC mosaic at 0.1, 0.4 and
+      1.6 km/px, and LOLA shaded relief with the sun from four directions (no albedo, other lighting than the mosaic).
+      Detections are clustered across passes (centres within \(0.35\,D\), \(|\Delta\ln D| < 0.35\)); a crater is kept
+      when two passes agree, or one pass is very confident. Craters that match a Robbins crater keep its position and
+      size. The result has 2.56 million craters, 1.27 million of them new (mostly 0.5–1 km), and its quad index
+      (15.3 million quads) uses only craters the detector sees.</p>
+    <p>The solver tries Robbins first and this catalog second. Robbins is best for large views; the new catalog
+      solves small views: Apollo crops 23 km wide from 3 of 36 to 15 of 36, and 45 km wide from 24 to 32 of 36.</p>
+
+    <h2 id="t-rig">10. Several cameras (rig)</h2>
+    <p>Cameras on one rigid mount, triggered together, with known mounting rotations \(R_{cr,i}\) and offsets
+      \(\mathbf t_i\), share one pose \((\mathbf C, R_{wr})\):</p>
+    $$R_{wc,i} = R_{cr,i}\,R_{wr}, \qquad \mathbf C_i = \mathbf C + R_{wr}^{\top}\mathbf t_i.$$
+    <p>One camera is solved blind; it predicts the others, whose craters are then matched (with an offset vote to
+      absorb the first prediction's error), and one robust fit of the 6 pose parameters uses all matches. Views in
+      different directions remove the trade-off between tilt and position of a single narrow camera: in tests the
+      3-D error fell from about 1.1 km (one camera) to 0.19 km.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="t-dense">11. Dense registration (experimental)</h2>
+    <p>After the crater fit, the image can be matched pixel by pixel to the LROC WAC mosaic rendered on LOLA terrain
+      through the current camera. Square patches are matched by normalised cross-correlation,</p>
+    $$\text{NCC}(a, b) = \frac{\sum (a - \bar a)(b - \bar b)}{\sqrt{\sum (a-\bar a)^2 \sum (b-\bar b)^2}},$$
+    <p>each match is a 2-D/3-D correspondence, and the pose is refitted (3–4 rounds, shrinking search). With the same
+      lighting as the map, the error falls from about 800 m to about 10 m. Shadows move with the sun, so for photos
+      with other lighting the matches are biased; a gate accepts the result only when the global correlation is at
+      least 0.9. It is off on the public server.</p>
+
+    <!-- ------------------------------------------------------------------ -->
+    <h2 id="accuracy">Accuracy</h2>
+    <p>Tests on real spacecraft images and on simulated views (no position hint in any test):</p>
     <table>
       <tr><th>Test</th><th>Solved</th><th>Wrong</th><th>Typical error</th></tr>
-      <tr><td>Apollo 15–17 Metric Camera, random vertical frames</td><td class="n">34 / 40</td><td class="n">0</td><td class="n">1.6 km*</td></tr>
-      <tr><td>Apollo, oblique frames with the horizon</td><td class="n">27 / 40</td><td class="n">0</td><td class="n">—</td></tr>
-      <tr><td>Simulated views, real WAC images, field of view unknown</td><td class="n">33 / 40</td><td class="n">0</td><td class="n">—</td></tr>
+      <tr><td>Apollo 15–17 Metric Camera, random vertical frames</td><td class="n">35 / 40</td><td class="n">0</td><td class="n">1.6 km*</td></tr>
+      <tr><td>Apollo, oblique frames with the horizon</td><td class="n">26 / 40</td><td class="n">0**</td><td class="n">0.9 km*</td></tr>
+      <tr><td>Apollo, crops 45 km wide</td><td class="n">32 / 36</td><td class="n">0</td><td class="n">0.4 km</td></tr>
+      <tr><td>Apollo, crops 23 km wide</td><td class="n">15 / 36</td><td class="n">0</td><td class="n">0.5 km</td></tr>
+      <tr><td>Simulated views, real WAC images, field of view unknown</td><td class="n">37 / 40</td><td class="n">0</td><td class="n">—</td></tr>
       <tr><td>Simulated views, field of view known</td><td class="n">40 / 40</td><td class="n">0</td><td class="n">~0.8 km</td></tr>
       <tr><td>Three cameras on one spacecraft, solved together</td><td class="n">22 / 30</td><td class="n">0</td><td class="n">0.19 km</td></tr>
     </table>
     <p class="muted">* Compared with the Apollo spacecraft positions on record, which have their own errors of
-      about a kilometre.</p>
-    <p>Most of the remaining error is in the catalog itself: crater positions in the catalog and in the maps
-      disagree by a few hundred metres. An experimental refinement matches the image pixel by pixel to the WAC
-      map. In simulations with the same lighting as the map it reduces the error to about 10 m, but for real
-      photos the different sun angle moves the shadows and biases the match, so it is off by default.</p>
+      about a kilometre. ** One more frame disagrees with its record by 70 km; that record is inconsistent with
+      the neighbouring frames.</p>
 
     <!-- ------------------------------------------------------------------ -->
-    <h2 id="limits">8. Limits</h2>
+    <h2 id="limits">Limits</h2>
     <ul>
       <li><b>High sun.</b> Near full Moon, craters show few shadows and the network finds fewer of them.</li>
-      <li><b>Small footprints.</b> The catalog has craters of 1 km and larger. An image needs about 15 of them,
+      <li><b>Small footprints.</b> The catalog has craters of about 1 km and larger. An image needs about 15 of them,
         so views less than about 25 km across rarely solve.</li>
-      <li><b>Compressed images.</b> Strong JPEG compression creates false crater detections in flat areas. Use PNG
-        or high-quality JPEG when you can.</li>
-      <li><b>Renders and art.</b> Many Moon images online are paintings or 3-D renders with invented craters. They
-        cannot match the real Moon.</li>
+      <li><b>Compressed images.</b> Strong JPEG compression creates false craters in flat areas. Use PNG or
+        high-quality JPEG when you can.</li>
+      <li><b>Distance in far views.</b> Without the field of view, the distance of a telescope image cannot be
+        measured; enter it under Options.</li>
+      <li><b>Renders and art.</b> Many Moon images online are paintings or 3-D renders with invented craters.</li>
     </ul>
 
     <!-- ------------------------------------------------------------------ -->
     <h2 id="api">API</h2>
-    <p>The website uses a public HTTP API. You can call it from any program.</p>
-    <pre><code>curl -F image=@photo.png -F fov_deg=20 <span id="api-base">https://…</span>/api/solve</code></pre>
+    <p>The website uses an HTTP API. The public server accepts solves only from this website, after an automatic
+      human check (Cloudflare Turnstile), and limits the number of solves per visitor. To call the API from your own
+      programs, run the server on your computer (<code>python server/api.py</code>, see the
+      <a href="https://github.com/Turtlely/lunar-platesolve">README</a>):</p>
+    <pre><code>curl -F image=@photo.png -F fov_deg=20 http://127.0.0.1:8000/api/solve</code></pre>
     <table>
       <tr><th>Endpoint</th><th>Input</th><th>Output</th></tr>
       <tr><td><code>POST /api/solve</code></td><td><code>image</code> (file); optional <code>fov_deg</code>,
         <code>parity</code>, <code>max_time</code>, <code>labels</code></td><td>camera latitude, longitude, altitude and
-        uncertainty; camera rotation and focal length; image footprint; detected and matched craters; named
-        features</td></tr>
-      <tr><td><code>GET /api/lookup?lat=&amp;lon=</code></td><td>a point</td><td>elevation, nearest named feature</td></tr>
+        uncertainty; camera centre \(\mathbf C\), rotation \(R_{wc}\), focal length, principal point; a latitude/longitude
+        grid on the terrain; image footprint; detected and matched craters; named features</td></tr>
+      <tr><td><code>GET /api/lookup?lat=&amp;lon=</code></td><td>a point</td><td>LOLA elevation, nearest named feature</td></tr>
       <tr><td><code>GET /api/health</code></td><td></td><td>status</td></tr>
     </table>
-    <p>Interactive documentation of every field: <code>/docs</code> on the API server.</p>
+    <p>One solve runs at a time; a request that waits more than 20 s gets HTTP 503 ("busy"). Too many requests give
+      HTTP 429 with a <code>Retry-After</code> time. Interactive documentation of every field: start the server with
+      <code>LUNAR_ENABLE_DOCS=1</code> and open <code>/docs</code>.</p>
 
     <!-- ------------------------------------------------------------------ -->
     <h2 id="credits">Data and credits</h2>
@@ -224,18 +362,10 @@
       <li>Apollo Metric Camera frames: NASA/JSC/Arizona State University.</li>
       <li>Feature names: IAU / USGS Gazetteer of Planetary Nomenclature.</li>
       <li>Method: after D. Lang et al. (2010), <i>Astrometry.net: blind astrometric calibration of arbitrary
-        astronomical images</i>, AJ 139.</li>
+        astronomical images</i>, AJ 139; heatmap detection after X. Zhou et al. (2019), <i>Objects as Points</i>.</li>
     </ul>
   </main>
 
   <footer class="foot"><a href="./">Solve an image</a></footer>
-  <script src="config.js?v=2"></script>
-  <script>
-    (function () {
-      var q = new URLSearchParams(location.search).get("api");
-      var base = (q || (window.LUNAR_CONFIG && window.LUNAR_CONFIG.api) || location.origin).replace(/\/$/, "");
-      document.getElementById("api-base").textContent = base;
-    })();
-  </script>
 </body>
 </html>

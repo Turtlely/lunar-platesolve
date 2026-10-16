@@ -100,7 +100,7 @@ def main(argv=None):
     feats = []
     if sol is not None and args.labels:
         from .names import Gazetteer
-        feats = Gazetteer().in_view(sol)
+        feats = Gazetteer(catalog=solver.cat).in_view(sol)
         print(f"{len(feats)} named features in view: " + ", ".join(f["ascii"] for f in feats[:20])
               + (" ..." if len(feats) > 20 else ""))
     if args.overlay:

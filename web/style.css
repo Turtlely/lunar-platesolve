@@ -97,6 +97,7 @@ input[type=checkbox] { accent-color: var(--text); }
 .k { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 2px solid; }
 .k-matched { border-color: var(--matched); }
 .k-dets { border-color: var(--dets); }
+.k-cat { border-color: #9a9a9a; }
 .k-grid { border-color: var(--grid); border-radius: 0; }
 .k-names { border-color: #d4b106; }
 .k-foot { border-color: var(--foot); border-radius: 0; margin-left: 10px; }

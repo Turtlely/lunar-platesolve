@@ -22,9 +22,47 @@ function apiBase() {
 
 const state = {
   file: null, fileUrl: null, image: null, result: null, controller: null, lastOpts: null,
-  layers: { matched: true, dets: false, grid: true, names: true },
+  layers: { matched: true, catalog: false, dets: false, grid: true, names: true },
   view: { s: 1, tx: 0, ty: 0 }, highlight: null, gridCache: null,
 };
+
+// ------------------------------------------------------------------ human check (Cloudflare Turnstile)
+// When the server has a Turnstile secret, every solve needs a fresh one-use token.  The widget is
+// invisible unless Cloudflare wants a click; it then shows in the "Solving" view.
+const human = { required: false, id: null, ready: null, pending: null };
+
+function loadTurnstile() {
+  const key = window.LUNAR_CONFIG && window.LUNAR_CONFIG.turnstileSiteKey;
+  if (!key || human.ready) return human.ready;
+  human.ready = new Promise((resolve, reject) => {
+    window.onTurnstileLoad = () => {
+      human.id = window.turnstile.render("#human", {
+        sitekey: key, execution: "execute", appearance: "interaction-only",
+        callback: (t) => { human.pending?.resolve(t); human.pending = null; },
+        "error-callback": () => { human.pending?.reject(new Error("The human check failed. Reload the page and try again.")); human.pending = null; },
+      });
+      resolve();
+    };
+    const s = document.createElement("script");
+    s.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onTurnstileLoad";
+    s.async = true;
+    s.onerror = () => reject(new Error("The human check could not load. Check the connection and reload."));
+    document.head.appendChild(s);
+  });
+  return human.ready;
+}
+
+async function humanToken() {
+  if (!human.required) return "";
+  if (!loadTurnstile()) throw new Error("This site has no human-check key. The solver cannot accept requests.");
+  await human.ready;
+  return new Promise((resolve, reject) => {
+    human.pending = { resolve, reject };
+    window.turnstile.reset(human.id);
+    window.turnstile.execute(human.id);
+    setTimeout(() => { if (human.pending) { human.pending = null; reject(new Error("The human check timed out. Try again.")); } }, 60000);
+  });
+}
 
 async function checkHealth() {
   try {
@@ -35,6 +73,8 @@ async function checkHealth() {
     if (!r.ok) throw new Error(r.status);
     const j = await r.json();
     $("#offline").hidden = true;
+    human.required = !!j.human_check;
+    if (human.required) loadTurnstile()?.catch(() => {});
     $("#refine-row").hidden = !j.refine;                 // high precision needs the WAC map on the server
     if (!j.refine) $("#opt-refine").checked = false;
   } catch (e) {
@@ -121,6 +161,7 @@ async function startSolve(file, opts = null) {
   state.controller = new AbortController();
   const imgPromise = loadImage(state.fileUrl);
   try {
+    fd.append("turnstile", await humanToken());
     const r = await fetch(apiBase() + "/api/solve", { method: "POST", body: fd, signal: state.controller.signal });
     if (!r.ok) {
       let msg = `The server answered ${r.status}.`;
@@ -147,7 +188,7 @@ function loadImage(url) {
 }
 
 // ------------------------------------------------------------------ camera model
-function makeCamera(cam) {
+function makeCamera(cam, geo = null) {
   const { C, Rwc, f, cx, cy, width, mirrored } = cam;
   function ray(u, v) {
     const uc = mirrored ? width - 1 - u : u;
@@ -167,11 +208,29 @@ function makeCamera(cam) {
     if (t <= 0) return null;
     return [C[0] + t * d[0], C[1] + t * d[1], C[2] + t * d[2]];
   }
-  function latlon(u, v) {
+  function sphereLatLon(u, v) {
     const p = hit(u, v);
     if (!p) return null;
     const r = Math.hypot(p[0], p[1], p[2]);
     return { lat: Math.asin(p[2] / r) * 180 / Math.PI, lon: ((Math.atan2(p[1], p[0]) * 180 / Math.PI) + 360) % 360 };
+  }
+  // On the LOLA terrain: bilinear interpolation of the server's grid.  Next to the limb (a grid
+  // corner misses the Moon) fall back to the mean sphere.
+  function latlon(u, v) {
+    if (!geo) return sphereLatLon(u, v);
+    const H = cam.height;
+    const fx = Math.min(Math.max(u / (width - 1) * geo.nx, 0), geo.nx - 1e-9);
+    const fy = Math.min(Math.max(v / (H - 1) * geo.ny, 0), geo.ny - 1e-9);
+    const i = Math.floor(fx), j = Math.floor(fy), a = fx - i, b = fy - j;
+    const k = [j * (geo.nx + 1) + i, j * (geo.nx + 1) + i + 1, (j + 1) * (geo.nx + 1) + i, (j + 1) * (geo.nx + 1) + i + 1];
+    const la = k.map((q) => geo.lat[q]), lo = k.map((q) => geo.lon[q]);
+    if (la.some((x) => x === null) || lo.some((x) => x === null)) return sphereLatLon(u, v);
+    const lo0 = lo[0];
+    const lu = lo.map((x) => lo0 + ((x - lo0 + 540) % 360 - 180));         // unwrap across 0/360
+    const w = [(1 - a) * (1 - b), a * (1 - b), (1 - a) * b, a * b];
+    const lat = w.reduce((t, x, q) => t + x * la[q], 0);
+    const lon = w.reduce((t, x, q) => t + x * lu[q], 0);
+    return { lat, lon: (lon % 360 + 360) % 360 };
   }
   return { ray, hit, latlon };
 }
@@ -185,7 +244,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 // ------------------------------------------------------------------ result view
 function showResult(res) {
   const sol = res.solution;
-  state.cam = makeCamera(sol.camera);
+  state.cam = makeCamera(sol.camera, sol.geo);
   state.highlight = null;
   state.gridCache = null;
   show("view-result");
@@ -199,35 +258,44 @@ function showResult(res) {
 
 function renderSummary(res) {
   const s = res.solution;
+  const far = s.method === "disk";
   const sig = s.refined ? s.refined.sigma_altitude_m / 1000 : s.altitude_sigma_km;
+  const num = (x) => x !== null && x !== undefined && Number.isFinite(x);
+  let alt;
+  if (far) alt = s.distance_measured ? `${Math.round(s.altitude_km + MOON_R).toLocaleString("en-US")} km from the centre` : "not measured";
+  else alt = `${fmtKm(s.altitude_km)}${num(sig) ? ` ± ${fmtDist(sig)}` : ""}`;
   const rows = [
-    ["Latitude", fmtLat(s.camera_lat), "main"],
-    ["Longitude", fmtLon(s.camera_lon), "main"],
-    ["Altitude", `${fmtKm(s.altitude_km)} ± ${fmtDist(sig)}`, "main"],
-    ["Image centre", `${fmtLat(s.center_lat, 3)}, ${fmtLon(s.center_lon, 3)}`, "gap"],
-    ["Resolution", `${s.gsd_m < 100 ? s.gsd_m.toFixed(1) : Math.round(s.gsd_m)} m/px`],
-    ["Tilt", `${s.off_nadir_deg.toFixed(1)}°`],
-    ["Image up", `${s.heading_deg.toFixed(1)}° from north`],
-    ["Field of view", `${s.fov_deg.toFixed(2)}°${s.focal_estimated ? " (est.)" : ""}`],
+    [far ? "Seen from lat." : "Latitude", fmtLat(s.camera_lat), "main"],
+    [far ? "Seen from lon." : "Longitude", fmtLon(s.camera_lon), "main"],
+    [far ? "Distance" : "Altitude", alt, "main"],
+    num(s.center_lat) ? ["Image centre", `${fmtLat(s.center_lat, 3)}, ${fmtLon(s.center_lon, 3)}`, "gap"] : null,
+    num(s.gsd_m) ? ["Resolution", `${s.gsd_m < 100 ? s.gsd_m.toFixed(1) : Math.round(s.gsd_m)} m/px`] : null,
+    !far && num(s.off_nadir_deg) ? ["Tilt", `${s.off_nadir_deg.toFixed(1)}°`] : null,
+    num(s.heading_deg) ? ["Image up", `${s.heading_deg.toFixed(1)}° from north`] : null,
+    num(s.fov_deg) ? ["Field of view", `${s.fov_deg < 2 ? s.fov_deg.toFixed(3) : s.fov_deg.toFixed(2)}°${s.focal_estimated && !far ? " (est.)" : ""}${far && !s.distance_measured ? " (assumed)" : ""}`] : null,
     ["Craters", `${s.n_matches} of ${res.detections.length} matched`],
     ["Time", `${res.time_s.toFixed(1)} s`],
-  ];
-  if (s.mirrored) rows.push(["Mirrored", "yes"]);
-  if (res.limb) rows.push(["Horizon", `used (tilt ${res.limb.tilt_deg.toFixed(1)}°)`]);
-  if (s.refined) rows.push(["Refined", `±${Math.round(s.refined.sigma_horizontal_m)} m horizontal`]);
+  ].filter(Boolean);
+  if (far) rows.push(["View", "far (disk edge used)"]);
+  if (s.catalog) rows.push(["Catalog", s.catalog === "CraterNet" ? "CraterNet (own, 2.6 M craters)" : "Robbins (1.3 M craters)"]);
   $("#summary").innerHTML = rows.map(([k, v, c]) => `<tr${c ? ` class="${c}"` : ""}><th>${k}</th><td>${v}</td></tr>`).join("");
   const note = $("#note");
-  note.hidden = !s.refine_rejected;
-  if (s.refine_rejected) note.textContent = `High precision skipped: ${s.refine_rejected}.`;
+  const notes = [];
+  if (far && !s.distance_measured) notes.push("Far view: the distance cannot be measured from the image alone. "
+    + "Enter the field of view under Options to measure it. From Earth it is 356,000–407,000 km.");
+  if (s.refine_rejected) notes.push(`High precision skipped: ${s.refine_rejected}.`);
+  note.hidden = !notes.length;
+  note.textContent = notes.join(" ");
   $("#near").textContent = "";
-  lookup(s.center_lat, s.center_lon).then((j) => {
+  const cLat = num(s.center_lat) ? s.center_lat : s.camera_lat, cLon = num(s.center_lon) ? s.center_lon : s.camera_lon;
+  lookup(cLat, cLon).then((j) => {
     if (!j) return;
     $("#near").innerHTML = j.inside ? `The image centre is inside <b>${esc(j.nearest)}</b>.`
       : `The image centre is ${fmtDist(j.nearest_km)} from <b>${esc(j.nearest)}</b>.`;
   });
   const copy = $("#copy-pos");
   copy.onclick = () => {
-    navigator.clipboard?.writeText(`${s.camera_lat.toFixed(5)}, ${s.camera_lon.toFixed(5)}, ${s.altitude_km.toFixed(3)} km`);
+    navigator.clipboard?.writeText(`${s.camera_lat.toFixed(5)}, ${s.camera_lon.toFixed(5)}` + (far && !s.distance_measured ? "" : `, ${s.altitude_km.toFixed(3)} km`));
     copy.textContent = "Copied";
     setTimeout(() => (copy.textContent = "Copy position"), 1400);
   };
@@ -466,6 +534,11 @@ function draw(target = null) {
     g.lineWidth = 1;
     for (const [x, y, r] of res.detections) { const p = P(x, y); g.beginPath(); g.arc(p[0], p[1], Math.max(1.5, r * s), 0, 7); g.stroke(); }
   }
+  if (state.layers.catalog) {
+    g.strokeStyle = "rgba(255,255,255,.9)";
+    g.lineWidth = 1;
+    for (const [x, y, r] of sol.matched_catalog || []) { const p = P(x, y); g.beginPath(); g.arc(p[0], p[1], Math.max(2, r * s), 0, 7); g.stroke(); }
+  }
   if (state.layers.matched) {
     g.strokeStyle = col("--matched");
     g.lineWidth = 2;
@@ -476,6 +549,8 @@ function draw(target = null) {
     (sol.features || []).forEach((f, i) => {
       const hl = state.highlight === i;
       if (!state.layers.names && !hl) return;
+      // declutter: a name appears when its feature is large enough at the current zoom
+      if (!hl && f.d_px && f.d_px * s < 18) return;
       g.strokeStyle = hl ? "#ffffff" : col("--names");
       g.lineWidth = hl ? 2.5 : 1.2;
       const p = P(f.u, f.v);
@@ -640,6 +715,30 @@ async function createGlobe(host) {
       }
       const C = T(sol.camera.C);
       const camMat = new THREE.MeshBasicMaterial({ color: 0x4fb3ff });
+      const center = ll2v(sol.center_lat ?? sol.camera_lat, sol.center_lon ?? sol.camera_lon, 1);
+      const Cn = C.clone().normalize();
+      if (C.length() > 4) {
+        // far view (thousands of km or more): the camera is off the scene; an arrow from the point
+        // below it shows the direction it looked from
+        const base = Cn.clone().multiplyScalar(1.002), tip = Cn.clone().multiplyScalar(1.9);
+        group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([base, tip]),
+          new THREE.LineBasicMaterial({ color: 0x4fb3ff })));
+        const head = new THREE.Mesh(new THREE.ConeGeometry(0.035, 0.12, 16), camMat);
+        head.position.copy(tip);
+        head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), Cn);
+        group.add(head);
+        // look from 35 degrees beside the camera direction, so that the arrow is seen from the side
+        let side = new THREE.Vector3(0, 1, 0).cross(Cn);
+        if (side.length() < 1e-6) side = new THREE.Vector3(1, 0, 0);
+        side.normalize();
+        const a35 = 35 * Math.PI / 180;
+        const view = Cn.clone().multiplyScalar(Math.cos(a35)).add(side.multiplyScalar(Math.sin(a35))).multiplyScalar(3.2);
+        current = { look: new THREE.Vector3(), close: view, far: Cn.clone().multiplyScalar(3.8) };
+        camera.position.copy(current.far);
+        controls.target.set(0, 0, 0);
+        setTimeout(() => flyTo(current.close, current.look, 1600), 300);
+        return;
+      }
       const dot = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), camMat);
       group.add(dot);
       // view cone: lines from the camera to the four image corners
@@ -652,18 +751,16 @@ async function createGlobe(host) {
         group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([C, T(p, 1.0004)]), coneMat));
       }
       // nadir line
-      const nadir = C.clone().normalize().multiplyScalar(1.0004);
+      const nadir = Cn.clone().multiplyScalar(1.0004);
       group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([C, nadir]),
         new THREE.LineDashedMaterial({ color: 0x9aa3b5, dashSize: 0.004, gapSize: 0.004 })).computeLineDistances());
-      const center = ll2v(sol.center_lat, sol.center_lon, 1);
       let ext = 0.01;
       for (const [a, o] of fp) ext = Math.max(ext, ll2v(a, o, 1).distanceTo(center));
-      const reach = Math.max(ext, C.distanceTo(center) * 0.6);
+      const reach = Math.min(Math.max(ext, C.distanceTo(center) * 0.6), 1.5);
       dot.scale.setScalar(Math.max(0.002, reach * 0.05));
       // oblique close view from behind the spacecraft: look at the middle between the footprint
       // centre and the camera's nadir, from 55 degrees off the vertical, so that the view cone
       // shows the altitude
-      const Cn = C.clone().normalize();
       const look = center.clone().add(Cn).multiplyScalar(0.5).normalize();
       const up = look.clone();
       let h = Cn.clone().sub(up.clone().multiplyScalar(up.dot(Cn)));    // towards the camera, along the surface

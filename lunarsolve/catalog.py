@@ -55,6 +55,7 @@ class Catalog:
         else:
             order = np.argsort(-z["diam"], kind="stable")
             np.save(order_path, order.astype(np.int32))
+        self.order = order                            # catalog row i = file row order[i]
         self.lat = z["lat"][order]
         self.lon = z["lon"][order]
         self.diam = z["diam"][order].astype(np.float64)

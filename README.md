@@ -117,8 +117,8 @@ API:
 
 | Endpoint | Input | Output |
 |---|---|---|
-| `GET /api/health` | | status, version |
-| `POST /api/solve` | multipart: `image`; optional `fov_deg`, `parity`, `max_time`, `labels`, `refine` | `ok`, `detections` (x, y, r, score), `solution` (camera position and 1-sigma, image centre, GSD, heading, off-nadir angle, FOV, camera centre `C`, rotation `Rwc`, focal length, principal point, footprint, matched detections, named features with outlines) |
+| `GET /api/health` | | status, version, `human_check` |
+| `POST /api/solve` | multipart: `image`; optional `fov_deg`, `parity`, `max_time`, `labels`, `refine`; `turnstile` (token) when the human check is on | `ok`, `detections` (x, y, r, score), `solution` (camera position and 1-sigma, image centre, GSD, heading, off-nadir angle, FOV, camera centre `C`, rotation `Rwc`, focal length, principal point, footprint, matched detections, named features with outlines) |
 | `GET /api/lookup?lat=&lon=` | ground point | LOLA elevation, nearest named feature |
 
 ```bash
@@ -147,14 +147,31 @@ machine, so the server can move without a change on the website.
   A record to the server, open ports 80 and 443, then
   `docker compose -f deploy/server/docker-compose.caddy.yml up -d --build`. Caddy gets the HTTPS
   certificate. Without Docker: `deploy/server/lunarsolve-api.service` (systemd).
-* Server size: at least 4 GB of RAM (the API uses about 3 GB after a few solves), 2 or more CPU
-  cores, about 6 GB of disk for the image and data.
+* Server size: at least 6 GB of RAM (two catalogs and two detectors), 2 or more CPU cores, about
+  8 GB of disk for the image and data.
 * CPU speed: about 2–6 s per 1-megapixel image with 2 threads. The WAC mosaic is not part of the
   server data, so high precision is off on servers that do not have it.
 * `deploy/hf-space/` and `scripts/deploy_hf.py` also deploy to a Hugging Face Docker Space (this
   needs a PRO account).
 
 Set `web/config.js` to the public API address.
+
+**Access control** (`server/api.py`, environment variables in `deploy/server/.env`). A static
+website calls the API from the visitor's browser, so the API address is always public. These
+layers limit what other programs can do with it:
+
+| Layer | Setting | Effect |
+|---|---|---|
+| Human check | `TURNSTILE_SECRET` (server), `turnstileSiteKey` (`web/config.js`) | Each solve needs a one-use Cloudflare Turnstile token from the website. Scripts get HTTP 403. |
+| Browser origin | `ALLOWED_ORIGINS` (default `https://lunar.rtang.dev`) | Other websites cannot call the API from a browser (CORS). |
+| Rate limit | `RATE_SOLVE` (default `6/60`), `RATE_LOOKUP` (`60/60`) | Requests per visitor IP (`CF-Connecting-IP`) per window in seconds. Over the limit: HTTP 429 with `Retry-After`. |
+| One solve at a time | built in | A second solve waits up to 20 s, then gets HTTP 503. |
+| API docs | `ENABLE_DOCS=0` | `/docs` and `/openapi.json` are off. |
+| Container | `docker-compose.yml` | No published ports, non-root user, no capabilities, no privilege escalation, memory and process limits. |
+
+A Cloudflare WAF rate-limiting rule on `/api/solve` adds a second limit before requests reach the
+server. For local tests, `web/config.js` uses Cloudflare's test site key on `localhost`, and the
+test secret `1x0000000000000000000000000000000AA` always passes.
 
 **Gradio demo** (local research app, needs the GPU and the data from
 [section 16](#16-setup-training-and-benchmarks), plus `pip install gradio plotly`):
@@ -687,6 +704,37 @@ $h = R_{\text{limb}} / \sin\rho - R$.
 7. **Consistency check.** The crater-solved altitude must agree with the limb altitude within 20%.
    A wrong focal-length guess distorts the rectified image, and this check rejects the result.
 
+### 9.1 Far views: telescope images and distant spacecraft (`lunarsolve/farview.py`)
+
+From far away (a telescope on Earth, a spacecraft thousands of km out), the camera sees the whole
+disk or a part of its edge. A perspective fit from a local crater match cannot extend to the whole
+disk, and the focal length and the distance cannot be told apart. The disk edge solves both problems.
+
+1. **Disk circle.** The background is the border-touching region below an Otsu threshold, on dark or
+   blue sky. RANSAC fits a circle to the sharp part of its boundary (the lit limb; the terminator is
+   soft). Accepted when the arc is at least 20°, the RMS at most $\max(2, 0.0008\,r)$ px, and no
+   disk pixels lie outside the circle.
+2. **Pixel → sphere.** With the circle (centre $\mathbf c$, radius $r$) and a camera at distance $D$
+   (focal length $f = r / \tan(\arcsin(R/D))$), every pixel on the disk maps to one surface point,
+   with camera-frame unit vector $\mathbf n(u, v)$.
+3. **Rotation in closed form.** Matched craters give $\mathbf n_i = R_{wc}\,\mathbf p_i$; Kabsch:
+   $H = \sum_i \mathbf p_i \mathbf n_i^\top = U S V^\top$, $R_{wc} = V\,\mathrm{diag}(1, 1, \det VU^\top)\,U^\top$.
+   The geometry is the exact sphere, so a local match extends to the whole disk.
+4. **Joint refinement.** Rotation and circle $(\mathbf c, r)$ are fitted together (soft-L1) to the
+   crater reprojection errors and the limb points; a short limb arc fixes the circle only to a few
+   percent. Then the whole disk is re-matched (up to 6 rounds).
+5. **Close-ups near the limb.** If the visible region is seen more than 25° from straight on, it is
+   first re-projected to a straight-down view over its centre, solved there, and mapped back.
+6. **Distance.** With the field of view, $D = R / \sin(\arctan(r/f))$. Without it, the distance is
+   not measured (`distance_measured = False`) and $D = 384{,}400$ km is used for drawing only.
+
+The solver tries the far-view finish whenever a disk is found and keeps the result with the higher
+log-odds, so orbital views with a limb are not affected. Results on two telescope images: a
+gibbous full disk solved with 490 matched craters (RMS 0.9 px; before: a wrong 42° / 4,988 km
+camera with 132 matches), sub-observer point $-5.8°$, $359.9°$; with FOV 0.6° given, distance
+367,000 km. A limb close-up near Crüger (36 craters detected before rectification, 126 after)
+solved with 46 matches.
+
 ---
 
 ## 10. Multi-camera rig
@@ -899,6 +947,52 @@ solver = Solver(catalog=Catalog(FINE_CATALOG_NPZ), index=QuadIndex(FINE_INDEX_PA
 The fine catalog comes from the WAC mosaic. For that reason the simulated WAC benchmarks cannot
 test the fine catalog fairly. The crop benchmark uses independent Apollo film instead.
 
+### 11.1 CraterNet catalog v2 and two-catalog solving
+
+`scripts/build_catalog_v2.py` builds a catalog with the same detector that reads the images. The
+solver hashes patterns of the largest craters it detects. With an index built from Robbins, the
+largest catalog craters of a region are often not the largest craters the detector finds there:
+in the WAC mosaic the detector sees only 41% of the 1–2 km and 33% of the 2–5 km Robbins craters
+(degraded rims, high sun). Patterns built from craters that the detector cannot see never match.
+
+1. **Detector v3** (`weights/craternet_v3.pt`): fine-tuned from `craternet.pt` for 16,000 steps with
+   tilt up to 75° (DEM renders up to 50°), JPEG compression, seeing blur, unsharp-mask halos,
+   brightness gradients, and dark or bright sky behind a limb edge (craters there become "ignore"
+   labels). On strongly tilted validation crops, recall rises from 0.42 to 0.55 and precision from
+   0.53 to 0.61; normal views are unchanged.
+2. **Nine detection passes** over the whole Moon:
+
+   | Pass | Source | Scale | Kept diameters |
+   |---|---|---|---|
+   | A | WAC mosaic | 0.1 km/px | 0.5–6 km |
+   | B | WAC mosaic | 0.4 km/px | 4–60 km |
+   | C | WAC mosaic | 1.6 km/px | 40–400 km |
+   | D0–D3 | LOLA shaded relief, sun 20° from N, E, S, W | 0.4 km/px | 4–60 km |
+   | E0–E1 | LOLA shaded relief, sun 20° from N, S | 1.6 km/px | 40–400 km |
+
+3. **Merge.** Each pass's diameter scale is calibrated against Robbins (0.988–0.998). Detections
+   are clustered across passes (centres within $0.35\,D$, $|\Delta \ln D| < 0.35$). A cluster is kept
+   when at least 2 passes found it, or one pass with a high score. Clusters that match a Robbins
+   crater of similar size keep the Robbins position and diameter. Result: 2,564,393 craters
+   (all 1,296,796 Robbins craters, 530,883 of them seen by the detector, plus 1,267,597 new ones,
+   mostly 0.5–1 km).
+4. **Index from seen craters only:** 15.3 million quads, $S_0 = 8/2^{1.5}$ km, 18 levels.
+
+**Two catalogs** (`lunarsolve/multi.py`, used by the API server): Robbins with `craternet.pt` gets
+the first half of the time budget; if it finds nothing, the CraterNet catalog with v3 gets the rest.
+
+| Benchmark | Robbins | CraterNet catalog | Both |
+|---|---|---|---|
+| Apollo full frames, random 40 | 35 | 32 | **35** |
+| Apollo full frames, oblique 40 | 25 | 20 | **26** |
+| Simulated WAC views, blind 40 | 36 | 35 | **37** |
+| Apollo crops ~45 km wide (36) | 24 | 31 | **32** |
+| Apollo crops ~23 km wide (36) | 3 | 16 | **15** |
+| Apollo crops ~11 km wide (36) | 0 | 1 | **1** |
+
+No wrong solutions, apart from one Apollo frame whose recorded position is inconsistent. The
+server needs about 2 GB more RAM for the second catalog (6 GB in total).
+
 ---
 
 ## 12. Named features and pixel lookup
@@ -1060,6 +1154,7 @@ lunarsolve/
   index.py      multi-scale quad index (python -m lunarsolve.index)
   solve.py      the solver, camera fit, acceptance rules, Solution
   limb.py       limb detection, cone fit, nadir rectification, scale prior
+  farview.py    far views (telescope, distant spacecraft): disk circle, Kabsch rotation, joint refit
   rig.py        joint solve of a rigid multi-camera rig
   refine.py     dense registration of a solved pose to the WAC basemap on LOLA terrain
   names.py      IAU named features: projection, labels, pixel lookup

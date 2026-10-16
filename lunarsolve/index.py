@@ -85,8 +85,11 @@ def _build_level(cells, ptr, nbr, xyz, rad, M, Q, s_lo, s_hi):
     return out_ids, out_codes
 
 
-def build(cat=None, verbose=True, s0=S0, n_levels=N_LEVELS, dmin_floor=1.0, path=INDEX_PATH):
-    """Build the index.  The fine catalog uses s0 = 8/2**1.5 km (3 extra levels) and a 0.6 km floor."""
+def build(cat=None, verbose=True, s0=S0, n_levels=N_LEVELS, dmin_floor=1.0, path=INDEX_PATH, use=None):
+    """Build the index.  The fine catalog uses s0 = 8/2**1.5 km (3 extra levels) and a 0.6 km floor.
+
+    use: optional boolean mask over catalog rows; only those craters form quads (for example the
+    craters the detector sees).  The quad ids still refer to rows of the full catalog."""
     cat = cat or Catalog()
     all_ids, all_codes, all_lvl = [], [], []
     for l in range(n_levels):
@@ -94,7 +97,10 @@ def build(cat=None, verbose=True, s0=S0, n_levels=N_LEVELS, dmin_floor=1.0, path
         s_lo, s_hi = level_band(l, s0)
         dmin = max(dmin_floor, s_lo / 30)
         dmax = s_hi * 0.7
-        pool = np.nonzero((cat.diam >= dmin) & (cat.diam <= dmax))[0]      # largest first
+        band = (cat.diam >= dmin) & (cat.diam <= dmax)
+        if use is not None:
+            band &= use
+        pool = np.nonzero(band)[0]                                         # largest first
         spacing = s_lo / 1.5
         n_cells = int(4 * math.pi * R * R / spacing ** 2)
         cells = fibonacci_sphere(n_cells)

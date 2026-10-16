@@ -23,6 +23,7 @@ RUN python server/fetch_data.py --repo "$DATA_REPO"
 COPY --chown=app lunarsolve lunarsolve
 COPY --chown=app server server
 COPY --chown=app weights/craternet.pt weights/craternet.pt
+COPY --chown=app weights/craternet_v3.pt weights/craternet_v3.pt
 
 EXPOSE 8000
 CMD ["python", "server/api.py", "--host", "0.0.0.0", "--port", "8000"]

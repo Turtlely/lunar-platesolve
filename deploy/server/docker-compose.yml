@@ -1,13 +1,26 @@
 # API + Cloudflare Tunnel on any Linux server with Docker.
 #
-#   cp .env.example .env        # paste the tunnel token
+#   cp .env.example .env        # paste the tunnel token and the Turnstile secret
 #   docker compose up -d --build
 #
 # The tunnel shares the network of the api container, so the tunnel's public hostname points to
 # http://localhost:8000 here, exactly as on a Windows PC that runs scripts/serve.ps1.  Moving the
-# server to a new machine needs no change in the Cloudflare dashboard or on the website.
+# server to a new machine needs no change on the website.
+#
+# Security: no published ports (only the tunnel reaches the API), so the CF-Connecting-IP header
+# that the rate limit uses always comes from Cloudflare.  Non-root user, no Linux capabilities,
+# no privilege escalation, memory/process limits and capped logs.
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
 services:
   api:
+    <<: *hardening
     build:
       context: ../..
       dockerfile: deploy/server/Dockerfile
@@ -15,14 +28,27 @@ services:
         DATA_REPO: ${LUNARSOLVE_DATA_REPO:-turtlely/lunarsolve-data}
     environment:
       OMP_NUM_THREADS: ${THREADS:-4}
-    restart: unless-stopped
-    # no published ports: only the tunnel can reach the API
+      LUNAR_ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://lunar.rtang.dev}
+      LUNAR_RATE_SOLVE: ${RATE_SOLVE:-6/60}
+      LUNAR_RATE_LOOKUP: ${RATE_LOOKUP:-60/60}
+      LUNAR_ENABLE_DOCS: ${ENABLE_DOCS:-0}
+      TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
+    mem_limit: ${MEM_LIMIT:-7g}
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    # no "ports:" section on purpose
 
   tunnel:
+    <<: *hardening
     image: cloudflare/cloudflared:latest
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
     network_mode: "service:api"
     depends_on: [api]
-    restart: unless-stopped
+    mem_limit: 256m

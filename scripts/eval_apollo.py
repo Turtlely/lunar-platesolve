@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--fov", type=float, default=None, help="give the solver this field of view (degrees)")
     ap.add_argument("--max-time", type=float, default=30)
     ap.add_argument("--weights", default=None, help="CraterNet weights file")
+    ap.add_argument("--catalog", default=None, help="crater catalog npz (default: Robbins)")
+    ap.add_argument("--index", default=None, help="quad index npz matching --catalog")
+    ap.add_argument("--multi", action="store_true", help="Robbins, then the CraterNet catalog (lunarsolve.multi)")
     ap.add_argument("--overlays", default=None, help="directory for annotated results")
     args = ap.parse_args()
 
@@ -101,7 +104,15 @@ def main():
     if not args.frames:
         rng = np.random.default_rng(args.seed)
         names = list(rng.choice(names, size=min(args.n, len(names)), replace=False))
-    solver = Solver()
+    if args.multi:
+        from lunarsolve.multi import default_solver
+        solver = default_solver()
+    elif args.catalog:
+        from lunarsolve.catalog import Catalog
+        from lunarsolve.index import QuadIndex
+        solver = Solver(catalog=Catalog(Path(args.catalog)), index=QuadIndex(Path(args.index)))
+    else:
+        solver = Solver()
     if args.weights:
         from lunarsolve.detect import load_model
         solver._model = load_model(args.weights, device="cuda")

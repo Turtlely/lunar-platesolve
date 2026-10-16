@@ -17,6 +17,22 @@ def load_ldem():
     return np.memmap(LDEM_IMG, dtype="<i2", mode="r", shape=(h, w))
 
 
+_LDEM = None
+
+
+def elevation_km(lat, lon):
+    """LOLA LDEM_64 height in km above the 1737.4 km sphere (nearest sample, 473 m grid)."""
+    global _LDEM
+    if _LDEM is None:
+        _LDEM = load_ldem()
+    H, W = _LDEM.shape
+    lat = np.asarray(lat, float)
+    lon = np.asarray(lon, float)
+    r = np.clip(((90 - lat) * LDEM_PPD - 0.5).round().astype(np.int64), 0, H - 1)
+    c = ((lon % 360) * LDEM_PPD - 0.5).round().astype(np.int64) % W
+    return _LDEM[r, c].astype(np.float64) * 0.0005
+
+
 class GpuRaster:
     """Global equirectangular raster on the GPU as a 2x pyramid, padded by 2 columns for
     longitude wrap.  Pixel (l, s) centre: lat = 90 - (l+0.5)/ppd, lon = (s+0.5)/ppd."""

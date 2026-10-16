@@ -33,7 +33,11 @@ P_MATCH = 0.6        # P(detection has a catalog counterpart | correct solution)
 WEAK_LOG_ODDS = 18.0 # accepted only if the largest craters are matched too (see _finish)
 STRONG_LOG_ODDS = 60.0  # accepted whatever fraction of the largest craters is matched
 MIN_MATCHES_WEAK = 10   # below STRONG_LOG_ODDS, a solution needs at least this many matches
-LIMB_ALT_TOL = 0.2      # limb altitude and crater-solved altitude must agree to this fraction
+LIMB_ALT_TOL = 0.2      # limb and crater-solved altitude agree to this fraction: candidate accepted
+LIMB_ALT_TOL_STRONG = 0.5   # up to this fraction only with strong crater evidence (limb altitude is rough)
+LIMB_STRONG_MATCHES = 40
+LIMB_STRONG_EVIDENCE = 150.0
+LIMB_STRONG_LOG_ODDS = 300.0   # a candidate this strong and within 10% of the limb altitude ends the search
 
 
 def p_match(d_km, ramp=(0.7, 2.5)):
@@ -77,14 +81,20 @@ class Solution:
         H, W = self.shape
         return ((W - 1) / 2 if self.cx is None else self.cx), ((H - 1) / 2 if self.cy is None else self.cy)
 
-    def pixel_to_latlon(self, u, v):
+    def pixel_to_latlon(self, u, v, terrain=True):
+        """Latitude/longitude seen at pixels.  terrain=True: where the ray meets the LOLA surface
+        (in oblique views the mean sphere is off by (height) x tan(viewing angle)); False: the sphere."""
         H, W = self.shape
         u = np.asarray(u, float)
         if self.mirrored:
             u = W - 1 - u
         cx, cy = self.principal()
         d = pixel_rays(u, np.asarray(v, float), self.C, self.Rwc, self.focal_px, cx, cy)
-        p, hit = ray_sphere(self.C, d)
+        if terrain:
+            from .simulate import terrain_hit
+            p, hit = terrain_hit(self.C, d, iters=5)
+        else:
+            p, hit = ray_sphere(self.C, d)
         lat, lon = vec_to_latlon(p)
         return np.where(hit, lat, np.nan), np.where(hit, lon, np.nan)
 
@@ -359,6 +369,28 @@ class Solver:
                 pairs.append((i, best))
         return np.array(pairs, np.int64).reshape(-1, 2), tol
 
+    DEADLINE_GRACE_S = 10.0     # finishing steps may run this long past max_time, then stop
+    OBLIQUE_COS = 0.5           # detections viewed more than 60 deg from the surface normal: no evidence
+    REMATCH_ITERS_PROFILE = 2   # re-match rounds per focal length of the profile
+    REMATCH_ITERS_FINAL = 2     # re-match rounds after the focal length is freed
+
+    def _past_deadline(self):
+        return time.time() > getattr(self, "_deadline", float("inf"))
+
+    def _oblique_dets(self, dets, C, Rwc, f, p, shape):
+        """Rows of dets that the camera sees off the Moon or at a grazing angle.
+
+        There craters are strongly foreshortened: the detector finds few of them and gives circle
+        radii that do not match the catalog.  Counting them as unmatched would penalize exactly the
+        cameras that see the most limb, such as a telescope view of the whole disk."""
+        H, W = shape
+        cx, cy = self._pp_cam(p, W)
+        u = dets[:, 0] if p > 0 else W - 1 - dets[:, 0]
+        d = pixel_rays(u, dets[:, 1], C, Rwc, f, cx, cy)
+        pts, hit = ray_sphere(C, d)
+        cos_e = -np.sum(d * pts, axis=1) / np.linalg.norm(pts, axis=1)
+        return np.nonzero(~hit | (cos_e < self.OBLIQUE_COS))[0]
+
     def _log_odds(self, dets, cat_uvr, pairs, tol, area, km_per_px, exclude=()):
         """Sum over detections of log P(data | match model) / P(data | chance)."""
         lr_cat = np.sort(np.log(cat_uvr[:, 2])) if len(cat_uvr) else np.zeros(0)
@@ -423,6 +455,20 @@ class Solver:
         H, W = shape
         self._pp = principal if principal is not None else ((W - 1) / 2, (H - 1) / 2)
         self._scale_prior = scale_prior       # optional km/px(uv) callable, e.g. from the limb
+        # Far view (telescope, distant spacecraft): the disk edge fixes the geometry (farview.py).
+        self._disk = None
+        if img is not None and limb and principal is None:
+            from .farview import disk_circle
+            g = np.asarray(img)
+            if g.ndim == 3 or g.dtype != np.float32:
+                from .detect import to_gray_float
+                g = to_gray_float(g)
+            self._disk = disk_circle(g)
+            if self._disk is not None:
+                # a close-up near the limb: solve a straight-down resampling first
+                sol = self._solve_far_rect(g, focal_px, max(0.5 * max_time, 5.0), t0, verbose)
+                if sol is not None:
+                    return sol
         if fov_deg is not None and focal_px is None:
             focal_px = (W / 2) / math.tan(math.radians(fov_deg) / 2)
         if dets.shape[1] > 3:
@@ -430,6 +476,8 @@ class Solver:
         dets = dets[np.argsort(-dets[:, 2], kind="stable")][:, :3].astype(np.float64)
         self.stats = dict(n_hyp=0, n_pre=0, n_det=len(dets), t_detect=time.time() - t0)
         self._accept = accept_log_odds
+        # hard stop for the steps after a hypothesis is accepted (profile, re-matching, disk finish)
+        self._deadline = t0 + max_time + self.DEADLINE_GRACE_S
         if len(dets) < 6:
             return None
         parities = {"both": (1, -1), "normal": (1,), "mirrored": (-1,)}[parity]
@@ -534,6 +582,10 @@ class Solver:
                                            min(accept_log_odds, WEAK_LOG_ODDS), A)
                 if res is not None:
                     sol = self._finish(dets, res, shape, focal_px, t0)
+                    if self._disk is not None:          # also try the far-view geometry; keep the stronger
+                        sol_f = self._farview_finish(dets, res, shape, focal_px, t0)
+                        if sol_f is not None and (sol is None or sol_f.log_odds > sol.log_odds):
+                            sol = sol_f
                     if sol is not None:
                         self.stats["batch"] = name
                         if verbose:
@@ -635,6 +687,7 @@ class Solver:
         if pts is None:
             return None
         H, W = img.shape
+        cands = []
         fovs = (74.0, 55.0, 90.0, 40.0, 110.0, 30.0)
         f_cands = [focal_px] if focal_px else [(W / 2) / math.tan(math.radians(v) / 2) for v in fovs]
         for i, fc in enumerate(f_cands):
@@ -684,20 +737,162 @@ class Solver:
             else:
                 f, f_est, alt_sig, rms, keep = fc, focal_px is None, sol_v.altitude_sigma_km, sol_v.rms_px,                     np.ones(len(cat_ids), bool)
             pairs = np.column_stack([pairs[keep, 0], np.arange(keep.sum())])
-            # The limb measures the altitude independently: a crater solution at the wrong
-            # focal-length guess is distorted and disagrees with it.
+            cat_ids = cat_ids[keep]
+            # The limb measures the altitude independently, but only roughly: at low altitude the limb
+            # is ~70 deg off nadir and 1 deg of cone angle is ~10 km of altitude.  So it only rejects
+            # gross disagreement (a wrong focal-length guess distorts the crater solution); among the
+            # candidates that pass, the crater evidence decides.
             alt_c = float(np.linalg.norm(C) - R)
-            if abs(alt_c - fit["altitude_km"]) > LIMB_ALT_TOL * fit["altitude_km"]:
-                if verbose:
-                    print(f"limb: rejected, crater altitude {alt_c:.1f} vs limb {fit['altitude_km']:.1f} km")
+            rel = abs(alt_c - fit["altitude_km"]) / fit["altitude_km"]
+            # within LIMB_ALT_TOL: accepted.  Up to LIMB_ALT_TOL_STRONG: only with strong crater evidence
+            # (the right focal length can disagree with a rough limb fit; a wrong one gives few matches).
+            strong = len(cat_ids) >= LIMB_STRONG_MATCHES and sol_v.log_odds >= LIMB_STRONG_EVIDENCE
+            ok = rel <= LIMB_ALT_TOL or (rel <= LIMB_ALT_TOL_STRONG and strong)
+            if verbose:
+                print(f"limb: crater altitude {alt_c:.1f} vs limb {fit['altitude_km']:.1f} km "
+                      f"({len(cat_ids)} matches, log-odds {sol_v.log_odds:.0f})" + ("" if ok else " -> rejected"))
+            if not ok:
                 continue
-            self.stats.update(limb_tilt=fit["tilt_deg"], limb_altitude_km=fit["altitude_km"],
-                              limb_rms_px=fit["rms_px"], limb_focal=fc)
-            return make_solution(C, Rwc, f, (H, W), self._pp, False, focal_px is None or f_est, alt_sig, rms,
-                                 sol_v.log_odds, pairs, cat_ids[keep], dets_r, t0,
-                                 R + float(np.median(self.cat.rim_height[cat_ids])), sol_v.top_frac,
-                                 method="limb")
-        return None
+            sol = make_solution(C, Rwc, f, (H, W), self._pp, False, focal_px is None or f_est, alt_sig, rms,
+                                sol_v.log_odds, pairs, cat_ids, dets_r, t0,
+                                R + float(np.median(self.cat.rim_height[cat_ids])), sol_v.top_frac,
+                                method="limb")
+            limb_info = dict(limb_tilt=fit["tilt_deg"], limb_altitude_km=fit["altitude_km"],
+                             limb_rms_px=fit["rms_px"], limb_focal=fc)
+            cands.append((sol.log_odds, sol, limb_info))
+            if sol.log_odds >= LIMB_STRONG_LOG_ODDS and rel <= 0.1:
+                break                                  # strong and consistent: no need to try more
+        if not cands:
+            return None
+        llr, sol, limb_info = max(cands, key=lambda c: c[0])
+        self.stats.update(limb_info)
+        return sol
+
+    def _solve_far_rect(self, img, focal_px, max_time, t0, verbose=False):
+        """Far view whose visible region is strongly tilted (a close-up near the limb): resample it to
+        a straight-down view (farview.rectify_region), solve that, and finish with the disk model."""
+        from .farview import FarCamera, rectify_region, virtual_to_image
+        disk, pp = self._disk, self._pp
+        cam = FarCamera(disk, focal_px=focal_px)
+        rect, info = rectify_region(img, cam)
+        if rect is None:
+            return None
+        if verbose:
+            print(f"far view: region tilt {info['tilt_deg']:.0f} deg, radius {info['theta_deg']:.1f} deg "
+                  f"-> straight-down view {info['size']} px")
+        try:
+            sol_v = self.solve(img=rect, focal_px=info["f_v"], parity="both", max_time=max_time, limb=False)
+        finally:
+            self._disk, self._pp = disk, pp
+        if sol_v is None:
+            return None
+        d_img = virtual_to_image(sol_v.dets[:, :3], info, cam)
+        ok = np.isfinite(d_img).all(1)
+        new_row = -np.ones(len(d_img), np.int64)
+        new_row[ok] = np.arange(ok.sum())
+        rows, cat_ids = sol_v.matches[:, 0], sol_v.matches[:, 1]
+        keep = ok[rows]
+        res = dict(pairs=np.column_stack([new_row[rows[keep]], np.arange(keep.sum())]), idx=cat_ids[keep],
+                   p=-1 if sol_v.mirrored else 1)
+        return self._farview_finish(d_img[ok], res, img.shape, focal_px, t0)
+
+    def _farview_finish(self, dets, res, shape, focal_px, t0, iters=6):
+        """Finish a hypothesis with the far-view model: disk circle + rotation (farview.py)."""
+        from .farview import FarCamera, kabsch, refine
+        H, W = shape
+        p = res["p"]
+        disk = dict(self._disk)
+        limb_pts = np.array(disk["pts"], float)
+        if p < 0:                                        # work in the un-mirrored camera frame
+            disk["cx"] = W - 1 - disk["cx"]
+            limb_pts[:, 0] = W - 1 - limb_pts[:, 0]
+        cam = FarCamera(disk, focal_px=focal_px)
+
+        def cam_uv(xy):
+            uv = np.array(xy, float, copy=True)
+            if p < 0:
+                uv[:, 0] = W - 1 - uv[:, 0]
+            return uv
+
+        pairs, idx = res["pairs"], res["idx"]
+        rows, cat_ids = pairs[:, 0], idx[pairs[:, 1]]
+        n_det = cam.normals(cam_uv(dets[rows, :2]))
+        ok = np.isfinite(n_det).all(1)
+        if ok.sum() < 4:
+            return None
+        Rwc = kabsch(self.cat.xyz[cat_ids[ok]], n_det[ok])
+        # refine rotation and circle on the hypothesis' own matches before matching more
+        if ok.sum() >= 6:
+            d_h = dets[rows[ok]]
+            cam, Rwc = refine(cam, Rwc, self.cat.xyz[cat_ids[ok]], cam_uv(d_h[:, :2]), 0.06 * d_h[:, 2] + 0.5,
+                              limb_pts, self._disk["rms"])
+        # catalog craters big enough to be detected anywhere on the disk
+        km_px_min = (cam.D - R) / cam.f
+        rmin = float(dets[:, 2].min())
+        big = np.nonzero(self.cat.diam >= 2 * 0.8 * rmin * km_px_min)[0]
+        llr, rms = -np.inf, np.inf
+        sel = np.nonzero(dets[:, 2] * 2 * km_px_min >= self.cat.d_min_km)[0][:800]
+        n_sel = cam.normals(cam_uv(dets[sel, :2]))
+        on_disk = np.isfinite(n_sel).all(1)
+        sel, n_sel = sel[on_disk], n_sel[on_disk]
+        if len(sel) < 8:
+            return None
+        sel_all = sel
+        for it in range(iters):
+            if it and self._past_deadline():
+                break
+            nn = self.cat.xyz[big] @ Rwc.T
+            uv, cos_e = cam.project(nn)
+            vis = (cos_e > 0.05) & (uv[:, 0] > -0.5) & (uv[:, 0] < W - 0.5) & (uv[:, 1] > -0.5) & (uv[:, 1] < H - 0.5)
+            ids = big[vis]
+            q = nn[vis] * R + [0.0, 0.0, cam.D]
+            r_px = self.cat.diam[ids] / 2 * cam.f / np.linalg.norm(q, axis=1) * np.sqrt(np.clip(cos_e[vis], 0.05, 1))
+            cat_uvr = np.column_stack([cam_uv(uv[vis]), r_px])          # back to image coordinates
+            pr, tol = self._match(dets[sel], cat_uvr)
+            if len(pr) < 8:
+                return None
+            # robust Kabsch: drop pairs whose angle on the sphere is far above the typical one
+            a = n_sel[pr[:, 0]]
+            b = self.cat.xyz[ids[pr[:, 1]]]
+            for _k in range(3):
+                Rwc = kabsch(b, a)
+                ang = np.linalg.norm(b @ Rwc.T - a, axis=1)
+                keep = ang <= max(3 * np.median(ang), 1e-4)
+                a, b = a[keep], b[keep]
+                pr = pr[keep]
+            # then refine the rotation and the disk circle together (craters + limb points)
+            d_m = dets[sel[pr[:, 0]]]
+            cam, Rwc = refine(cam, Rwc, b, cam_uv(d_m[:, :2]), 0.06 * d_m[:, 2] + 0.5, limb_pts, self._disk["rms"])
+            m_rows, m_ids = sel[pr[:, 0]], ids[pr[:, 1]]              # matches as absolute rows / catalog ids
+            # evidence (on this round's detection set); detections seen at grazing angles carry none
+            cos_d = cam.project(n_sel)[1]
+            obl = np.nonzero(cos_d < self.OBLIQUE_COS)[0]
+            gsd = (cam.D - R) / cam.f
+            llr = self._log_odds(dets[sel], cat_uvr, pr, tol, float(H * W), gsd, exclude=obl)
+            # the refined circle changes which detections are on the disk
+            n_new = cam.normals(cam_uv(dets[sel_all, :2]))
+            fin = np.isfinite(n_new).all(1)
+            sel, n_sel = sel_all[fin], n_new[fin]
+        uv_fit, _ = cam.project(self.cat.xyz[m_ids] @ Rwc.T)
+        res_px = np.hypot(*(cam_uv(uv_fit) - dets[m_rows, :2]).T)
+        rms = float(np.sqrt(np.mean(res_px ** 2)))
+        if len(m_rows) < MIN_MATCHES_WEAK or not (llr >= STRONG_LOG_ODDS or llr >= self._accept):
+            return None
+        C, Rwc = cam.pose(Rwc)
+        # distance: from the disk radius when the focal length is known, else not measurable
+        if cam.D_measured:
+            s_r = self._disk["rms"] / math.sqrt(max(self._disk["inliers"], 1))
+            alt_sig = cam.D * s_r / cam.r
+        else:
+            alt_sig = float("inf")
+        out_pairs = np.column_stack([m_rows, np.arange(len(m_rows))])
+        cat_out = m_ids
+        sol = make_solution(C, Rwc, cam.f, shape, (cam.cx, cam.cy), p < 0, not cam.D_measured, alt_sig, rms, llr,
+                            out_pairs, cat_out, dets, t0, R + float(np.median(self.cat.rim_height[cat_out])),
+                            method="disk")
+        sol.distance_measured = cam.D_measured
+        sol.disk = dict(cx=(W - 1 - cam.cx) if p < 0 else cam.cx, cy=cam.cy, r=cam.r)
+        return sol
 
     @staticmethod
     def _codes_for(dets, quads, p):
@@ -806,6 +1001,8 @@ class Solver:
         def rematch(cam, pairs, cat_ids, llr, f_fixed, iters=3):
             """Re-match every detection against the catalog projected through the camera, refit."""
             for _ in range(iters):
+                if self._past_deadline():
+                    break
                 C, Rwc, f = cam[0], cam[1], cam[2]
                 gsd = float(np.linalg.norm(C)) - R
                 gsd = max(gsd, 1e-3) / f
@@ -821,7 +1018,9 @@ class Solver:
                 if cam2 is None or cam2[6].sum() < cam[6].sum() - max(2, 0.02 * cam[6].sum()):
                     break
                 cam, pairs, cat_ids = cam2, np.column_stack([sel[pr[:, 0]], pr[:, 1]]), idx[pr[:, 1]]
-                llr = self._log_odds(dets[sel], cat_uvr, pr, tol, float(H * W), gsd)
+                # detections seen very obliquely by this camera carry no evidence (see _oblique_dets)
+                obl = self._oblique_dets(dets[sel], cam2[0], cam2[1], cam2[2], p, shape)
+                llr = self._log_odds(dets[sel], cat_uvr, pr, tol, float(H * W), gsd, exclude=obl)
             return cam, pairs, cat_ids, llr
 
         # Fixed focal length(s): the given one, or a profile over plausible fields of view.
@@ -837,11 +1036,16 @@ class Solver:
         def run_profile(fs):
             nonlocal best, best_f
             for fc in fs:
+                if best is not None and self._past_deadline():
+                    break
                 cam = self._fit_camera(dets[start[0][:, 0]], start[1], model, p, shape, fc)
                 if cam is None:
                     continue
-                r = rematch(cam, *start, fc, iters=2)
+                r = rematch(cam, *start, fc, iters=self.REMATCH_ITERS_PROFILE)
                 profile.append((int(r[0][6].sum()), r[0][5], float(np.linalg.norm(r[0][0]) - R)))
+                self.stats.setdefault("profile", []).append(
+                    (round(math.degrees(2 * math.atan(W / 2 / fc)), 3), int(r[0][6].sum()), round(float(r[0][5]), 2),
+                     round(float(np.linalg.norm(r[0][0]) - R)), round(float(r[3]), 1)))
                 if best is None or (r[0][6].sum(), -r[0][5]) > (best[0][6].sum(), -best[0][5]):
                     best, best_f = r, fc
 
@@ -860,7 +1064,7 @@ class Solver:
             cam2 = self._fit_camera(dets[pairs[:, 0]], cat_ids, model, p, shape, None, init=cam[:3])
             # the free model nests the fixed one; small inlier-count differences are noise
             if cam2 is not None and cam2[6].sum() >= cam[6].sum() - max(2, 0.02 * cam[6].sum()):
-                cam, pairs, cat_ids, llr = rematch(cam2, pairs, cat_ids, llr, None, iters=2)
+                cam, pairs, cat_ids, llr = rematch(cam2, pairs, cat_ids, llr, None, iters=self.REMATCH_ITERS_FINAL)
         C, Rwc, f, f_est, alt_sig, rms, keep = cam
         if len(keep) != len(pairs):
             return None

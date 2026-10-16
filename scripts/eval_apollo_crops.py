@@ -70,10 +70,14 @@ def ground_point(t, u, v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fine", action="store_true")
+    ap.add_argument("--catalog", default=None, help="crater catalog npz (overrides --fine)")
+    ap.add_argument("--index", default=None, help="quad index npz matching --catalog")
+    ap.add_argument("--multi", action="store_true", help="Robbins, then the CraterNet catalog (lunarsolve.multi)")
     ap.add_argument("--sizes", type=int, nargs="+", default=[256, 512, 1024])
     ap.add_argument("--per-frame", type=int, default=6)
     ap.add_argument("--max-time", type=float, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--weights", default=None, help="CraterNet weights file")
     args = ap.parse_args()
 
     from lunarsolve.catalog import Catalog
@@ -82,12 +86,20 @@ def main():
     if not TRUTH_PATH.exists() or len(json.loads(TRUTH_PATH.read_text())) < len(FRAMES):
         truth = truth_solutions(Solver())
     truth = json.loads(TRUTH_PATH.read_text())
-    if args.fine:
+    if args.multi:
+        from lunarsolve.multi import default_solver
+        solver = default_solver()
+    elif args.catalog:
+        solver = Solver(catalog=Catalog(Path(args.catalog)), index=QuadIndex(Path(args.index)))
+    elif args.fine:
         from lunarsolve.config import FINE_CATALOG_NPZ, FINE_INDEX_PATH
         solver = Solver(catalog=Catalog(FINE_CATALOG_NPZ), index=QuadIndex(FINE_INDEX_PATH))
     else:
         solver = Solver()
-    print(f"catalog: {'fine' if args.fine else 'Robbins'} ({len(solver.cat):,} craters, {len(solver.index):,} quads)")
+    if args.weights:
+        from lunarsolve.detect import load_model
+        solver._model = load_model(args.weights)
+    print(f"catalog: {args.catalog or ('fine' if args.fine else 'Robbins')} ({len(solver.cat):,} craters, {len(solver.index):,} quads)")
     rng = np.random.default_rng(args.seed)
     res = {s: [] for s in args.sizes}
     for name, t in truth.items():

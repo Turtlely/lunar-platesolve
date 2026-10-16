@@ -16,17 +16,19 @@ import torch
 from .catalog import Catalog
 from .config import WEIGHTS_PATH
 from .model import CraterNet, build_targets, centernet_loss, decode, normalize
-from .synth import DemRenderer, wac_sample
+from .synth import DemRenderer, augment_batch, wac_sample
 
 TRAIN_LON = (0.0, 330.0)
 VAL_LON = (330.0, 360.0)
 
 
 class WacStream(torch.utils.data.IterableDataset):
-    def __init__(self, size, lon_range, seed):
+    def __init__(self, size, lon_range, seed, tilt_max_deg=25.0, p_tilt=0.5):
         self.size = size
         self.lon_range = lon_range
         self.seed = seed
+        self.tilt_max_deg = tilt_max_deg
+        self.p_tilt = p_tilt
 
     def __iter__(self):
         from .terrain import WacMosaic
@@ -36,7 +38,8 @@ class WacStream(torch.utils.data.IterableDataset):
         cat = Catalog()
         wac = WacMosaic()
         while True:
-            img, keep, ign, meta = wac_sample(wac, cat, rng, self.size, self.lon_range)
+            img, keep, ign, meta = wac_sample(wac, cat, rng, self.size, self.lon_range,
+                                              tilt_max_deg=self.tilt_max_deg, p_tilt=self.p_tilt)
             if img.std() < 1e-3:
                 continue
             yield torch.from_numpy(img)[None], keep, ign
@@ -79,6 +82,12 @@ def main():
     ap.add_argument("--init", default=None, help="start from these weights (fresh LR schedule)")
     ap.add_argument("--no-albedo", action="store_true", help="noise albedo only (no Clementine map)")
     ap.add_argument("--out", default=str(WEIGHTS_PATH))
+    ap.add_argument("--tilt-max", type=float, default=25.0, help="largest foreshortening tilt (deg)")
+    ap.add_argument("--p-tilt", type=float, default=0.5, help="fraction of tilted samples")
+    ap.add_argument("--tilt-max-dem", type=float, default=50.0,
+                    help="cap for the DEM renders (the render grid grows as 1/cos(tilt)); WAC crops use --tilt-max")
+    ap.add_argument("--augment", action="store_true",
+                    help="photo defects and sky/limb negatives (synth.augment_batch)")
     args = ap.parse_args()
 
     dev = "cuda"
@@ -93,7 +102,8 @@ def main():
     rend = DemRenderer(dem, cat, args.size, dev, albedo=albedo)
     n_wac = int(round(args.batch * args.wac_frac))
     n_dem = args.batch - n_wac
-    loader = iter(torch.utils.data.DataLoader(WacStream(args.size, TRAIN_LON, 0), batch_size=n_wac,
+    loader = iter(torch.utils.data.DataLoader(WacStream(args.size, TRAIN_LON, 0, args.tilt_max, args.p_tilt),
+                                              batch_size=n_wac,
                                               num_workers=args.workers, collate_fn=collate,
                                               persistent_workers=True, prefetch_factor=4))
     model = CraterNet().to(dev).to(memory_format=torch.channels_last)
@@ -118,12 +128,19 @@ def main():
         val.append(("dem", imgs, k))
         wi, wk, _ = next(vloader)
         val.append(("wac", wi.to(dev), wk))
+    # strongly oblique views (flattened craters), the case the tilt augmentation is for
+    vloader_obl = iter(torch.utils.data.DataLoader(WacStream(args.size, VAL_LON, 78, tilt_max_deg=75.0, p_tilt=1.0),
+                                                   batch_size=16, num_workers=0, collate_fn=collate))
+    for _ in range(4):
+        wi, wk, _ = next(vloader_obl)
+        val.append(("wac_oblique", wi.to(dev), wk))
 
     dem_q = queue.Queue(maxsize=4)
 
     def dem_worker():
         while True:
-            dem_q.put(rend.render(n_dem, rng, lon_range=TRAIN_LON, gsd_range=(0.6, 4.0)))
+            dem_q.put(rend.render(n_dem, rng, lon_range=TRAIN_LON, gsd_range=(0.6, 4.0),
+                                  tilt_max_deg=min(args.tilt_max, args.tilt_max_dem), p_tilt=args.p_tilt))
 
     threading.Thread(target=dem_worker, daemon=True).start()
     t0 = time.time()
@@ -135,6 +152,8 @@ def main():
         imgs = torch.cat([ims_d, ims_w.to(dev, non_blocking=True)])
         # random flips/rot90 are free augmentation
         keeps, ignores = kd + kw, igd + igw
+        if args.augment:
+            imgs, keeps, ignores = augment_batch(imgs, keeps, ignores, rng)
         if it % 2:
             imgs = imgs.flip(-1)
             S = imgs.shape[-1]
@@ -160,7 +179,7 @@ def main():
                   f"lr {sched.get_last_lr()[0]:.2e} {(time.time() - t0) / (it + 1 - start):.3f}s/it", flush=True)
         if (it + 1) % 2000 == 0 or it + 1 == args.iters:
             model.eval()
-            for src in ("dem", "wac"):
+            for src in ("dem", "wac", "wac_oblique"):
                 tp = nd = ng = 0
                 rerr = []
                 for s, im, k in val:

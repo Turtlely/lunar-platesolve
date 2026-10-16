@@ -63,7 +63,9 @@ def build_names():
 
 
 class Gazetteer:
-    def __init__(self):
+    def __init__(self, catalog=None):
+        """catalog: a lunarsolve.catalog.Catalog.  If given, named craters are drawn at the position,
+        size and rim height of their catalog counterpart (see _snap)."""
         if not NAMES_NPZ.exists():
             build_names()
         z = np.load(NAMES_NPZ)
@@ -72,6 +74,39 @@ class Gazetteer:
         self.type, self.code = z["type"], z["code"]
         self.xyz = latlon_to_vec(self.lat, self.lon)
         self.is_crater = np.isin(self.code, list(CRATER_CODES))
+        # Height of the point that is seen: the rim (mean LOLA height on the rim circle) for craters,
+        # the LOLA height at the centre for other features.  Projection onto the mean sphere puts
+        # features off by (height) x tan(viewing angle), which is large in oblique views.
+        from .catalog import rim_heights
+        from .terrain import elevation_km
+        self.h = elevation_km(self.lat, self.lon)
+        rim = self.is_crater & (self.diam > 0)
+        self.h[rim] = rim_heights(self.lat[rim], self.lon[rim], self.diam[rim])
+        self.snapped = np.zeros(len(self.lat), bool)
+        if catalog is not None:
+            self._snap(catalog)
+
+    def _snap(self, cat):
+        """Move named craters to their crater-catalog counterpart.
+
+        The IAU centres come from older maps and differ from the catalog (median 0.36 km, 10% more
+        than 1.5 km).  The camera is fitted to the catalog, so drawing at the catalog position makes
+        the outlines agree with the image.  Counterpart: the nearest catalog crater within 0.3
+        diameters whose diameter is within 30%."""
+        cr = np.nonzero(self.is_crater & (self.diam >= 1.0))[0]
+        cand = cat.tree.query_ball_point(self.xyz[cr], 0.3 * self.diam[cr] / R)
+        for k, i in enumerate(cr):
+            js = np.asarray(cand[k], np.int64)
+            if len(js) == 0:
+                continue
+            js = js[np.abs(np.log(cat.diam[js] / self.diam[i])) < 0.3]
+            if len(js) == 0:
+                continue
+            j = js[np.argmin(np.linalg.norm(cat.xyz[js] - self.xyz[i], axis=1))]
+            self.lat[i], self.lon[i], self.diam[i] = cat.lat[j], cat.lon[j], cat.diam[j]
+            self.xyz[i] = cat.xyz[j]
+            self.h[i] = cat.rim_height[j]
+            self.snapped[i] = True
 
     def in_view(self, sol, min_diam_px=14.0, satellite_min_px=40.0):
         """Named features visible in a solved image.
@@ -82,7 +117,7 @@ class Gazetteer:
         """
         H, W = sol.shape
         cx, cy = sol.principal()
-        P = self.xyz * R
+        P = self.xyz * (R + self.h)[:, None]
         uv, z = project(P, sol.C, sol.Rwc, sol.focal_px, cx, cy)
         nrm = self.xyz
         facing = np.sum(nrm * (sol.C - P), axis=1) > 0
@@ -121,12 +156,15 @@ class Gazetteer:
 
 
 def crater_outline(sol, lat, lon, diam_km, n=48):
-    """Image polyline of a crater rim (a circle on the sphere), for drawing."""
-    from .geometry import enu_basis
+    """Image polyline of a crater rim: a circle on the sphere, each point lifted to its LOLA height."""
+    from .geometry import enu_basis, vec_to_latlon
+    from .terrain import elevation_km
     e, nn, u = enu_basis(lat, lon)
     a = np.linspace(0, 2 * np.pi, n, endpoint=False)
     r = diam_km / 2
     pts = u * R + (np.cos(a)[:, None] * e + np.sin(a)[:, None] * nn) * r
+    plat, plon = vec_to_latlon(pts)
+    pts = pts / np.linalg.norm(pts, axis=1, keepdims=True) * (R + elevation_km(plat, plon))[:, None]
     H, W = sol.shape
     cx, cy = sol.principal()
     uv, z = project(pts, sol.C, sol.Rwc, sol.focal_px, cx, cy)

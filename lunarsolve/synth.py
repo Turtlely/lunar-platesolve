@@ -80,7 +80,7 @@ def smooth_noise(B, size, device, octaves=(4, 8, 16, 32), gen=None):
 def gaussian_blur(img, sigma):
     """Per-sample gaussian blur; sigma (B,) tensor in pixels."""
     B = img.shape[0]
-    k = 7
+    k = max(7, 2 * int(math.ceil(3 * float(sigma.max()))) + 1)
     xs = torch.arange(k, device=img.device, dtype=img.dtype) - k // 2
     s = sigma.clamp_min(1e-3).view(B, 1)
     w = torch.exp(-0.5 * (xs[None] / s) ** 2)
@@ -117,6 +117,17 @@ def lunar_lambert_L(phase_deg):
     return float(np.clip(1 - 0.019 * g + 2.42e-4 * g ** 2 - 1.46e-6 * g ** 3, 0.0, 1.0))
 
 
+def sample_tilt(rng, tilt_max_deg=25.0, p_tilt=0.5):
+    """Foreshortening tilt (radians).  With p_tilt: uniform up to tilt_max_deg, and when that is
+    above 40 deg, half of the tilted samples come from [40, tilt_max_deg] (oblique views near the
+    limb, telescope views far from the disk centre)."""
+    if rng.random() >= p_tilt:
+        return 0.0
+    if tilt_max_deg > 40 and rng.random() < 0.5:
+        return math.radians(rng.uniform(40.0, tilt_max_deg))
+    return math.radians(rng.uniform(0.0, min(tilt_max_deg, 40.0)))
+
+
 def sample_sun_elevation(rng):
     """Sun elevation (radians): low, mid, high and near-overhead regimes equally likely."""
     return math.radians(rng.choice([rng.uniform(1.5, 20), rng.uniform(5, 45), rng.uniform(10, 75),
@@ -132,15 +143,17 @@ class DemRenderer:
         self.albedo = albedo                 # GpuAlbedo (real albedo map) or None
         self.p_real_albedo = p_real_albedo
 
-    def render(self, B, rng, lon_range=(0, 360), gsd_range=(0.45, 4.0), tilt_max_deg=25.0):
+    def render(self, B, rng, lon_range=(0, 360), gsd_range=(0.45, 4.0), tilt_max_deg=25.0, p_tilt=0.5):
         S = self.size
-        S1 = int(math.ceil(S * 1.45)) // 2 * 2
         dev = self.device
         imgs = torch.empty(B, 1, S, S, device=dev)
         keeps, ignores, metas = [], [], []
-        albedo = 1.0 + smooth_noise(B, S1, dev) * torch.tensor(rng.uniform(0.0, 0.25, B), device=dev).view(B, 1, 1, 1).float()
-        albedo = albedo.clamp(0.3, 2.0)
         for b in range(B):
+            # the tilted view covers 1/cos(tilt) more ground along one axis: grid sized per sample
+            tilt = sample_tilt(rng, tilt_max_deg, p_tilt)
+            S1 = int(math.ceil(S * 1.45 / math.cos(tilt))) // 2 * 2
+            alb_amp = rng.uniform(0.0, 0.25)
+            albedo_b = (1.0 + smooth_noise(1, S1, dev)[0, 0] * alb_amp).clamp(0.3, 2.0)
             while True:
                 lat0, lon0 = random_center(rng)
                 if lon_range[0] <= lon0 < lon_range[1]:
@@ -176,7 +189,7 @@ class DemRenderer:
             Hs = z + (gi + c1) * gsd * math.tan(sun_el)
             shadow = torch.cummax(Hs, dim=1).values > Hs + 1e-5
             ambient = rng.uniform(0.0, 0.04)
-            alb = albedo[b, 0]
+            alb = albedo_b
             # Clementine imaged near zero phase at low latitude only; above ~45 deg its map
             # carries topographic shading, so the real albedo is used at low latitudes.
             if self.albedo is not None and abs(lat0) < 45 and rng.random() < self.p_real_albedo:
@@ -186,10 +199,12 @@ class DemRenderer:
                 alb = a_real * (1 + 0.3 * (alb - 1))       # keep a little fine-scale noise
             rad = torch.where(shadow, torch.zeros_like(phot), phot).float()
             rad = rad * alb + ambient * alb
-            # random final orientation, mild anisotropy (oblique view), crop to S
+            # random final orientation, anisotropy (oblique view), crop to S
             rot = rng.uniform(0, 2 * math.pi)
-            tilt = math.radians(rng.uniform(0, tilt_max_deg)) if rng.random() < 0.5 else 0.0
             taz = rng.uniform(0, math.pi)
+            if tilt > 0.35:            # the warp minifies by cos(tilt): blur first against aliasing
+                rad = gaussian_blur(rad[None, None], torch.tensor([0.5 * math.tan(tilt)], device=dev,
+                                                                    dtype=rad.dtype))[0, 0]
             Rr = np.array([[math.cos(rot), -math.sin(rot)], [math.sin(rot), math.cos(rot)]])
             Rt = np.array([[math.cos(taz), -math.sin(taz)], [math.sin(taz), math.cos(taz)]])
             Ds = np.diag([math.cos(tilt), 1.0])
@@ -204,10 +219,11 @@ class DemRenderer:
             Pg = np.stack([ax, ay]) / gsd
             A = M @ Pg
             keep, ign = catalog_labels(self.cat, lat0, lon0, A, np.array([c, c]), gsd, S,
-                                       extent_km=S * gsd * 1.2, rmin=R_MIN, rmax=R_MAX, dmin_km=0.0)
+                                       extent_km=S * gsd * 1.2 / math.cos(tilt), rmin=R_MIN, rmax=R_MAX,
+                                       dmin_km=0.0)
             keeps.append(keep)
             ignores.append(ign)
-            metas.append(dict(lat=lat0, lon=lon0, gsd=gsd, sun_el=math.degrees(sun_el)))
+            metas.append(dict(lat=lat0, lon=lon0, gsd=gsd, sun_el=math.degrees(sun_el), tilt=math.degrees(tilt)))
         imgs = sensor_model(imgs, rng, dev)
         return imgs, keeps, ignores, metas
 
@@ -215,7 +231,7 @@ class DemRenderer:
 # ----------------------------------------------------------------------------- WAC crops
 
 def wac_sample(wac, cat, rng, size=256, lon_range=(0, 360), gsd_range=(0.25, 3.0), tilt_max_deg=25.0,
-               max_abs_lat=80.0):
+               max_abs_lat=80.0, p_tilt=0.5):
     S = size
     while True:
         lat0, lon0 = random_center(rng, max_abs_lat)
@@ -223,7 +239,7 @@ def wac_sample(wac, cat, rng, size=256, lon_range=(0, 360), gsd_range=(0.25, 3.0
             break
     gsd = math.exp(rng.uniform(math.log(gsd_range[0]), math.log(gsd_range[1])))
     rot = rng.uniform(0, 2 * math.pi)
-    tilt = math.radians(rng.uniform(0, tilt_max_deg)) if rng.random() < 0.5 else 0.0
+    tilt = sample_tilt(rng, tilt_max_deg, p_tilt)
     taz = rng.uniform(0, math.pi)
     Rr = np.array([[math.cos(rot), -math.sin(rot)], [math.sin(rot), math.cos(rot)]])
     Rt = np.array([[math.cos(taz), -math.sin(taz)], [math.sin(taz), math.cos(taz)]])
@@ -239,8 +255,77 @@ def wac_sample(wac, cat, rng, size=256, lon_range=(0, 360), gsd_range=(0.25, 3.0
     v /= np.linalg.norm(v, axis=-1, keepdims=True)
     lat = np.degrees(np.arcsin(v[..., 2]))
     lon = np.degrees(np.arctan2(v[..., 1], v[..., 0])) % 360
-    img = wac.sample(lat, lon, gsd) / 255.0
-    keep, ign = catalog_labels(cat, lat0, lon0, A, np.array([c, c]), gsd, S, extent_km=S * gsd * 1.2,
+    # pyramid level for the coarser (foreshortened) axis too: geometric mean of the two scales
+    img = wac.sample(lat, lon, gsd / math.sqrt(math.cos(tilt))) / 255.0
+    keep, ign = catalog_labels(cat, lat0, lon0, A, np.array([c, c]), gsd, S,
+                               extent_km=S * gsd * 1.2 / math.cos(tilt),
                                rmin=R_MIN, rmax=R_MAX, dmin_km=CATALOG_DMIN_KM)
     # Craters below the catalog completeness limit are unknown: ignore anything below it.
     return img.astype(np.float32), keep, ign, dict(lat=lat0, lon=lon0, gsd=gsd)
+
+
+# ----------------------------------------------------------------------------- batch augmentation
+
+def augment_batch(imgs, keeps, ignores, rng, p_sky=0.15, p_unsharp=0.3, p_gradient=0.3, p_blur=0.25,
+                  p_jpeg=0.35):
+    """Defects of real photos that the renders lack, on a training batch (B, 1, S, S) in [0, 1].
+
+    * sky / limb: the part of the image beyond a random large circle becomes dark (space) or flat
+      bright (daytime blue sky in grey); craters there or cut by the edge become "ignore" labels,
+      so that the network learns not to fire on empty sky or on the limb;
+    * strong seeing blur (telescopes), unsharp-mask halos (phone and astro processing),
+      brightness gradients (vignetting, scattered light), JPEG compression.
+    Returns (imgs, keeps, ignores) with the labels updated.
+    """
+    import cv2
+    B, _, S, _ = imgs.shape
+    dev = imgs.device
+    keeps, ignores = list(keeps), list(ignores)
+    jj, ii = torch.meshgrid(torch.arange(S, device=dev, dtype=imgs.dtype),
+                            torch.arange(S, device=dev, dtype=imgs.dtype), indexing="ij")
+    for b in range(B):
+        x = imgs[b, 0]
+        if rng.random() < p_sky:
+            # a circle much larger than the image whose edge crosses it: the limb
+            ang = rng.uniform(0, 2 * math.pi)
+            rad = S * math.exp(rng.uniform(math.log(1.2), math.log(20.0)))
+            px, py = rng.uniform(0.2, 0.8) * S, rng.uniform(0.2, 0.8) * S       # a point on the edge
+            cx, cy = px - rad * math.cos(ang), py - rad * math.sin(ang)
+            dist = torch.sqrt((ii - cx) ** 2 + (jj - cy) ** 2) - rad              # > 0: sky
+            soft = rng.uniform(0.5, 2.0)
+            sky_w = torch.sigmoid(dist / soft)
+            level = rng.uniform(0.0, 0.04) if rng.random() < 0.7 else rng.uniform(0.15, 0.4)
+            sky = level + torch.randn_like(x) * rng.uniform(0.0, 0.01)
+            imgs[b, 0] = x * (1 - sky_w) + sky * sky_w
+            x = imgs[b, 0]
+
+            def split(lab):
+                if not len(lab):
+                    return lab, lab
+                d = np.hypot(lab[:, 0] - cx, lab[:, 1] - cy) - rad
+                bad = d > -lab[:, 2]                     # beyond or cut by the limb
+                return lab[~bad], lab[bad]
+            k_ok, k_bad = split(keeps[b])
+            keeps[b] = k_ok
+            if len(k_bad):
+                ignores[b] = np.vstack([ignores[b], k_bad]) if len(ignores[b]) else k_bad
+        if rng.random() < p_blur:
+            imgs[b:b + 1] = gaussian_blur(imgs[b:b + 1], torch.tensor([rng.uniform(1.3, 3.0)], device=dev,
+                                                                     dtype=imgs.dtype))
+        if rng.random() < p_unsharp:
+            r = torch.tensor([rng.uniform(1.0, 4.0)], device=dev, dtype=imgs.dtype)
+            bl = gaussian_blur(imgs[b:b + 1], r)
+            imgs[b:b + 1] = (imgs[b:b + 1] + rng.uniform(0.4, 2.0) * (imgs[b:b + 1] - bl)).clamp(0, 1)
+        if rng.random() < p_gradient:
+            a = rng.uniform(0, 2 * math.pi)
+            g = 1 + rng.uniform(-0.4, 0.4) * ((ii - S / 2) * math.cos(a) + (jj - S / 2) * math.sin(a)) / S
+            rr = ((ii - S / 2) ** 2 + (jj - S / 2) ** 2) / (S * S / 2)
+            g = g * (1 - rng.uniform(0, 0.4) * rr)
+            imgs[b, 0] = (imgs[b, 0] * g).clamp(0, 1)
+        if rng.random() < p_jpeg:
+            u8 = (imgs[b, 0].clamp(0, 1) * 255).round().to(torch.uint8).cpu().numpy()
+            ok, buf = cv2.imencode(".jpg", u8, [cv2.IMWRITE_JPEG_QUALITY, int(rng.uniform(35, 95))])
+            if ok:
+                dec = cv2.imdecode(buf, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+                imgs[b, 0] = torch.from_numpy(dec).to(dev, imgs.dtype)
+    return imgs, keeps, ignores

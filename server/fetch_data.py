@@ -25,6 +25,11 @@ DATA_FILES = {
     "ldem_64.img": 531,                # LOLA LDEM_64, for elevation lookup and terrain
     "ldem_64.lbl": 0,
     "names/moon_names.npz": 2,         # IAU named features
+    # CraterNet catalog v2 (scripts/build_catalog_v2.py): second catalog, for small footprints
+    "cn_catalog.npz": 72,
+    "cn_catalog_order.npy": 10,
+    "cn_catalog_rim_height.npy": 10,
+    "quad_index_cn.npz": 748,
 }
 
 
