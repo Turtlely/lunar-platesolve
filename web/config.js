@@ -7,5 +7,5 @@
 const LOCAL = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
 window.LUNAR_CONFIG = {
   api: LOCAL ? "" : "https://lunar-api.rtang.dev",
-  turnstileSiteKey: LOCAL ? "0x4AAAAAAFYLfzkSO4ICdzj5" : "",
+  turnstileSiteKey: LOCAL ? "1x00000000000000000000AA" : "0x4AAAAAAFYLfzkSO4ICdzj5",
 };
