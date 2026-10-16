@@ -112,11 +112,13 @@ def check_turnstile(token, ip):
     import requests
     try:
         r = requests.post(TURNSTILE_URL, data=dict(secret=TURNSTILE_SECRET, response=token, remoteip=ip), timeout=10)
-        ok = bool(r.json().get("success"))
+        j = r.json()
+        ok = bool(j.get("success"))
     except Exception as ex:  # noqa: BLE001
         print("turnstile check failed:", ex, flush=True)
         raise HTTPException(503, "The human check is not available. Try again in a minute.")
     if not ok:
+        print("turnstile rejected:", j.get("error-codes"), j.get("hostname"), flush=True)
         raise HTTPException(403, "Human check failed. Reload the page and try again.")
 
 _state = {}
